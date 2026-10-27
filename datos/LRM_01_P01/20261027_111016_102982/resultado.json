@@ -1,0 +1,9 @@
+{
+  "resultado": "RuntimeError: Parachoques activado; mision cancelada",
+  "tiempo_s": 0.7172332999980426,
+  "error_final_m": 0.5099019513592785,
+  "vmax_ordenada_m_s": 0.009520871845249336,
+  "ciclos_retrasados": 0,
+  "distancia_minima_obstaculos_m": null,
+  "nota": "Parte 01 sin IR. Velocidad registrada: ordenada, no medida externamente."
+}

@@ -1,0 +1,9 @@
+{
+  "resultado": "meta_alcanzada",
+  "tiempo_s": 22.263416800000414,
+  "error_final_m": 0.04964876634922568,
+  "vmax_ordenada_m_s": 0.04999999999617656,
+  "ciclos_retrasados": 0,
+  "distancia_minima_obstaculos_m": null,
+  "nota": "Parte 01 sin IR. Velocidad registrada: ordenada, no medida externamente."
+}

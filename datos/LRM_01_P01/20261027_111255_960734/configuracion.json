@@ -1,0 +1,20 @@
+{
+  "robot": "C3_UIEC_Grupo4",
+  "meta_x": 1.0,
+  "meta_y": -0.3,
+  "meta_theta": null,
+  "potencial": "hibrido",
+  "ganancia": 1.0,
+  "transicion": 0.3,
+  "kv": 0.4,
+  "kw": 1.5,
+  "vmax": 0.05,
+  "wmax": 0.8000000000000002,
+  "rueda_max": 0.1,
+  "separacion_ruedas": 0.235,
+  "tolerancia": 0.05,
+  "tolerancia_angular": 0.05235987755982989,
+  "periodo": 0.1,
+  "tiempo_max": 120.0,
+  "timeout_lectura": 2.0
+}
