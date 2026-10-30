@@ -5,12 +5,202 @@ Programa autonomo organizado por responsabilidades.
 import argparse
 import asyncio
 import csv
+import io
 import json
 import math
+import os
+import re
+import sys
 import time
 from dataclasses import dataclass, asdict, replace
 from datetime import datetime
 from pathlib import Path
+
+
+# INTERFAZ DE TERMINAL
+# Colores ANSI solo en una consola interactiva; NO_COLOR los desactiva.
+ANCHO = 66
+_TTY = sys.stdout.isatty()
+_COLOR = _TTY and "NO_COLOR" not in os.environ
+
+if _TTY and os.name == "nt":
+    os.system("")  # Activa las secuencias ANSI en la consola de Windows.
+
+if isinstance(sys.stdout, io.TextIOWrapper):
+    # Una salida redirigida en Windows usa cp1252: escribir UTF-8.
+    if not _TTY:
+        sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(errors="replace")
+
+NEGRITA, TENUE = "1", "2"
+ROJO, VERDE, AMARILLO, CIAN = "31", "32", "33", "36"
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_linea_viva = False
+
+
+def estilo(texto, *codigos):
+    if not _COLOR or not codigos:
+        return str(texto)
+    return f"\x1b[{';'.join(codigos)}m{texto}\x1b[0m"
+
+
+def _visible(texto):
+    return len(_ANSI.sub("", texto))
+
+
+def _junto(*partes):
+    return estilo(" · ", TENUE).join(partes)
+
+
+def _cerrar_linea():
+    """Terminar la linea de estado en vivo antes de escribir otra cosa."""
+    global _linea_viva
+    if _linea_viva:
+        print()
+        _linea_viva = False
+
+
+def cabecera(titulo, subtitulo=None):
+    _cerrar_linea()
+    borde = "─" * (ANCHO - 2)
+
+    def en_caja(texto):
+        relleno = " " * max(0, ANCHO - 4 - _visible(texto))
+        return f"{estilo('│', CIAN)} {texto}{relleno} {estilo('│', CIAN)}"
+
+    print()
+    print(estilo(f"╭{borde}╮", CIAN))
+    print(en_caja(estilo(titulo, NEGRITA)))
+    if subtitulo:
+        print(en_caja(estilo(subtitulo, TENUE)))
+    print(estilo(f"╰{borde}╯", CIAN))
+
+
+def seccion(titulo):
+    _cerrar_linea()
+    texto = f"── {titulo} "
+    print()
+    print(
+        "  " + estilo(texto, CIAN, NEGRITA)
+        + estilo("─" * max(0, ANCHO - 2 - len(texto)), CIAN)
+    )
+
+
+def _mensaje(simbolo, texto, color):
+    _cerrar_linea()
+    print(f"  {estilo(simbolo, color, NEGRITA)} {texto}")
+
+
+def ok(texto):
+    _mensaje("✓", texto, VERDE)
+
+
+def aviso(texto):
+    _mensaje("!", texto, AMARILLO)
+
+
+def fallo(texto):
+    _mensaje("✗", texto, ROJO)
+
+
+def info(texto):
+    _mensaje("•", texto, CIAN)
+
+
+def nota(texto):
+    _cerrar_linea()
+    print(f"    {estilo(texto, TENUE)}")
+
+
+def fila(etiqueta, valor):
+    print(f"    {estilo(f'{etiqueta:<27}', TENUE)}{valor}")
+
+
+def preguntar(texto, actual=None):
+    pista = "" if actual is None else " " + estilo(f"[{actual}]", TENUE)
+    return input(f"  {estilo('›', CIAN, NEGRITA)} {texto}{pista}: ")
+
+
+def apartado(clave, nombre, *lineas):
+    """Entrada del resumen: [clave] nombre y una o varias lineas de valores."""
+    marca = estilo(f"[{clave}]", CIAN, NEGRITA) if clave else "   "
+    print(f"  {marca} {estilo(f'{nombre:<20}', NEGRITA)}{lineas[0]}")
+    for linea in lineas[1:]:
+        print(" " * 26 + linea)
+
+
+def lista_opciones(opciones, actual):
+    """opciones: (tecla, valor interno, nombre, descripcion)."""
+    for tecla, valor, nombre, descripcion in opciones:
+        marca = estilo("  ● actual", VERDE) if valor == actual else ""
+        print(
+            f"  {estilo(f'[{tecla}]', CIAN, NEGRITA)} "
+            f"{nombre:<20}{estilo(descripcion, TENUE)}{marca}"
+        )
+    print()
+
+
+_ESTADOS = {
+    "NAVEGACION": ("Navegando", CIAN),
+    "ORIENTACION_FINAL": ("Orientando", AMARILLO),
+    "LLEGADA": ("En meta", VERDE),
+}
+
+
+def mostrar_estado(t, pose, distancia, estado, v):
+    """Linea de estado que se reescribe en cada ciclo de control."""
+    global _linea_viva
+    if not _TTY:
+        return
+
+    nombre, color = _ESTADOS.get(estado, (estado, CIAN))
+    texto = (
+        f"  {estilo(f'{nombre:<10}', color, NEGRITA)} "
+        f"t {t:5.1f} s  "
+        f"({pose.x*100:6.1f},{pose.y*100:6.1f}) cm  "
+        f"θ {math.degrees(pose.theta):4.0f}°  "
+        f"d {distancia*100:5.1f} cm  "
+        f"v {v*100:4.1f} cm/s"
+    )
+    print("\r\x1b[2K" + texto, end="", flush=True)
+    _linea_viva = True
+
+
+def _cm(valor, unidad="cm"):
+    return "N/D" if valor is None else f"{valor*100:.1f} {unidad}"
+
+
+def mostrar_resultado(datos, carpeta):
+    seccion("Resultado")
+
+    if datos["resultado"] == "meta_alcanzada":
+        ok(estilo("Meta alcanzada", VERDE, NEGRITA))
+    else:
+        fallo(estilo(datos["resultado"], ROJO, NEGRITA))
+
+    print()
+    fila("Tiempo", f"{datos['tiempo_s']:.1f} s")
+    fila("Error final (odometria)", _cm(datos["error_final_m"]))
+    fila("Vmax ordenada", _cm(datos["vmax_ordenada_m_s"], "cm/s"))
+    fila(
+        "Vmax estimada (odometria)",
+        _cm(datos["vmax_estimada_odometria_m_s"], "cm/s")
+    )
+    fila("Ciclos retrasados", datos["ciclos_retrasados"])
+    fila("Plazos omitidos", datos["plazos_omitidos"])
+    fila("Registro", estilo(carpeta, TENUE))
+
+
+def avisos_inicio():
+    seccion("Antes de iniciar")
+    aviso("Coloque el robot en el origen, fuera de la base.")
+    aviso("Compruebe que la zona esta SIN obstaculos.")
+    info(
+        "La odometria se adapta al angulo inicial indicado; "
+        "no se gira para alinearla."
+    )
+    print()
 
 
 # CONFIGURACION
@@ -89,8 +279,8 @@ class Configuracion:
 def pedir_numero(texto, actual, positivo=False):
     """Intro conserva el valor. Una entrada incorrecta se vuelve a pedir."""
     while True:
-        entrada = input(
-            f"{texto} [{actual:g}]: "
+        entrada = preguntar(
+            texto, f"{actual:g}"
         ).strip().replace(",", ".")
 
         try:
@@ -102,26 +292,34 @@ def pedir_numero(texto, actual, positivo=False):
             return valor
 
         except ValueError:
-            print(
+            fallo(
                 "Introduzca un numero finito"
                 + (" mayor que cero." if positivo else ".")
             )
 
 
+ROSA_VIENTOS = (
+    "              +Y (90°)",
+    "                  ▲",
+    "    -X (180°) ◄───┼───► +X (0°)",
+    "                  ▼",
+    "              -Y (-90°)",
+)
+
+
 def pedir_orientacion_inicial():
     """Exigir un angulo escrito; no suponer que el robot mira hacia +Y."""
-    print(
-        "Ejes fijos del suelo: "
-        "0 grados = +X; 90 = +Y; 180 = -X; -90 = -Y."
-    )
-    print(
-        "El robot empieza en (0, 0), "
-        "pero puede mirar en cualquier direccion."
-    )
+    print()
+    for linea in ROSA_VIENTOS:
+        print("  " + estilo(linea, CIAN))
+    print()
+    nota("Ejes fijos del suelo. El robot empieza en (0, 0),")
+    nota("pero puede mirar en cualquier direccion.")
+    print()
 
     while True:
-        entrada = input(
-            "Escriba la orientacion INICIAL del robot (grados): "
+        entrada = preguntar(
+            "Orientacion INICIAL del robot (grados)"
         ).strip()
 
         try:
@@ -133,95 +331,125 @@ def pedir_orientacion_inicial():
             return math.radians(valor)
 
         except ValueError:
-            print(
+            fallo(
                 "Es obligatorio escribir un angulo finito, "
                 "por ejemplo 45 o -90."
             )
 
 
-def mostrar_configuracion(c):
-    print("\n--- P01: configuracion de la mision ---")
-    print(
-        "Origen: (0, 0) inicial. "
-        "X e Y son ejes fijos marcados en el suelo."
-    )
-    print(
-        f"   Orientacion INICIAL: "
-        f"{math.degrees(c.orientacion_inicial):g} grados"
-    )
+def mostrar_configuracion(c, menu=True):
+    """Resumen de la mision. En el menu cada apartado lleva su tecla."""
+    def tecla(k):
+        return k if menu else ""
 
-    print(f"1. Meta: X={c.meta_x*100:g} cm, Y={c.meta_y*100:g} cm")
-
-    orientacion = (
-        "sin orientacion final"
+    final = (
+        "libre"
         if c.meta_theta is None
-        else f"{math.degrees(c.meta_theta):g} grados"
+        else f"{math.degrees(c.meta_theta):g}°"
     )
 
-    print(
-        f"   Orientacion FINAL: {orientacion} "
-        "(90 grados = direccion +Y)"
+    cabecera(
+        "Configuracion de la mision",
+        "Origen (0, 0) inicial · X e Y: ejes fijos del suelo"
     )
-    print(
-        f"2. Potencial: {c.potencial}; "
-        f"ganancia={c.ganancia:g}; "
-        f"transicion={c.transicion*100:g} cm"
+    print()
+
+    apartado(
+        tecla("0"), "Orientacion inicial",
+        f"{math.degrees(c.orientacion_inicial):g}°",
+        estilo("0° = +X · 90° = +Y · 180° = -X · -90° = -Y", TENUE)
     )
-    print(
-        f"3. Control: kv={c.kv:g}, kw={c.kw:g}; "
-        f"avance max={c.vmax*100:g} cm/s"
+    apartado(
+        tecla("1"), "Meta",
+        _junto(f"X = {c.meta_x*100:g} cm", f"Y = {c.meta_y*100:g} cm"),
+        f"orientacion final: {final}"
     )
-    print(
-        f"   Giro max={math.degrees(c.wmax):g} grados/s; "
-        f"rueda max={c.rueda_max*100:g} cm/s"
+    apartado(
+        tecla("2"), "Potencial",
+        _junto(
+            c.potencial,
+            f"k = {c.ganancia:g}",
+            f"transicion = {c.transicion*100:g} cm"
+        )
     )
-    print(
-        f"   Aceleracion={c.aceleracion*100:g} cm/s2; "
-        f"frenado={c.frenado*100:g} cm/s2"
+    apartado(
+        tecla("3"), "Control",
+        _junto(f"kv = {c.kv:g}", f"kw = {c.kw:g}"),
+        _junto(
+            f"avance ≤ {c.vmax*100:g} cm/s",
+            f"rueda ≤ {c.rueda_max*100:g} cm/s"
+        ),
+        f"giro ≤ {math.degrees(c.wmax):g}°/s",
+        _junto(
+            f"aceleracion {c.aceleracion*100:g} cm/s²",
+            f"frenado {c.frenado*100:g} cm/s²"
+        )
     )
-    print(
-        f"4. Llegada: error <= {c.tolerancia*100:g} cm; "
-        f"error angular <= "
-        f"{math.degrees(c.tolerancia_angular):g} grados"
+    apartado(
+        tecla("4"), "Llegada",
+        _junto(
+            f"error ≤ {c.tolerancia*100:g} cm",
+            f"error angular ≤ {math.degrees(c.tolerancia_angular):g}°"
+        ),
+        _junto(
+            f"periodo {c.periodo:g} s",
+            f"tiempo maximo {c.tiempo_max:g} s"
+        )
     )
-    print(
-        f"   Periodo={c.periodo:g} s; "
-        f"tiempo maximo={c.tiempo_max:g} s"
+    apartado(
+        tecla("5"), "Robot",
+        c.robot,
+        _junto(
+            f"separacion ruedas {c.separacion_ruedas*100:g} cm",
+            f"timeout {c.timeout_lectura:g} s"
+        )
     )
-    print(
-        f"5. Robot: {c.robot}; "
-        f"separacion de ruedas={c.separacion_ruedas*100:g} cm"
+    apartado(
+        tecla("6"), "Repulsion",
+        _junto(
+            c.repulsivo,
+            f"k = {c.ganancia_repulsiva:g}",
+            f"influencia = {c.influencia*100:g} cm"
+        ),
+        estilo("registrada, SIN efecto en P01 (sin obstaculos)", TENUE)
     )
-    print(
-        f"   Tiempo limite de comunicaciones="
-        f"{c.timeout_lectura:g} s"
-    )
-    print(
-        f"6. Repulsion: {c.repulsivo}; "
-        f"ganancia={c.ganancia_repulsiva:g}; "
-        f"influencia={c.influencia*100:g} cm"
-    )
-    print(
-        "   Parametros registrados, SIN efecto en P01: "
-        "escenario libre de obstaculos."
-    )
-    print("I. Iniciar mision con estos valores | Q. Salir sin conectar")
-    print("0. Corregir la orientacion inicial introducida")
+
+    if menu:
+        print()
+        print("  " + estilo("─" * (ANCHO - 4), TENUE))
+        print(
+            f"  {estilo('[I]', VERDE, NEGRITA)} Iniciar mision    "
+            f"{estilo('[Q]', ROJO, NEGRITA)} Salir sin conectar    "
+            f"{estilo('[0-6]', CIAN, NEGRITA)} Editar"
+        )
+
+
+def editar_orientacion(c):
+    return replace(
+        c,
+        orientacion_inicial=pedir_orientacion_inicial()
+    ).validar()
 
 
 def editar_meta(c):
     x = pedir_numero("Meta X (cm)", c.meta_x*100) / 100
     y = pedir_numero("Meta Y (cm)", c.meta_y*100) / 100
 
-    print(
+    nota(
         "Rumbo absoluto del escenario: "
         "0 = +X, 90 = +Y, 180 = -X, -90 = -Y."
     )
+    nota("'no' desactiva la orientacion final.")
+
+    actual = (
+        "no"
+        if c.meta_theta is None
+        else f"{math.degrees(c.meta_theta):g}"
+    )
 
     while True:
-        valor = input(
-            "Orientacion final en grados "
-            "(Intro conserva; 'no' desactiva): "
+        valor = preguntar(
+            "Orientacion final (grados)", actual
         ).strip().lower()
 
         try:
@@ -244,35 +472,31 @@ def editar_meta(c):
             ).validar()
 
         except ValueError:
-            print("Introduzca un angulo finito o 'no'.")
+            fallo("Introduzca un angulo finito o 'no'.")
 
 
 def editar_potencial(c):
-    opciones = {
-        "1": "cuadratico",
-        "2": "conico",
-        "3": "hibrido",
-        "4": "suave"
-    }
-
-    print("1. Cuadratico: atraccion proporcional a la distancia.")
-    print("2. Conico: magnitud constante fuera de la meta.")
-    print("3. Hibrido: cuadratico cerca, conico lejos.")
-    print(
-        "4. Propio (suave): "
-        "transicion gradual hasta una atraccion limitada."
+    opciones = (
+        ("1", "cuadratico", "Cuadratico",
+         "atraccion proporcional a la distancia"),
+        ("2", "conico", "Conico",
+         "magnitud constante fuera de la meta"),
+        ("3", "hibrido", "Hibrido",
+         "cuadratico cerca, conico lejos"),
+        ("4", "suave", "Propio (suave)",
+         "transicion gradual, atraccion limitada"),
     )
+    lista_opciones(opciones, c.potencial)
+    claves = {tecla: valor for tecla, valor, *_ in opciones}
 
     while True:
-        entrada = input(
-            f"Potencial 1-4 [actual: {c.potencial}; Intro conserva]: "
-        ).strip()
+        entrada = preguntar("Potencial 1-4", c.potencial).strip()
 
-        if not entrada or entrada in opciones:
-            potencial = opciones.get(entrada, c.potencial)
+        if not entrada or entrada in claves:
+            potencial = claves.get(entrada, c.potencial)
             break
 
-        print("Elija una opcion del 1 al 4.")
+        fallo("Elija una opcion del 1 al 4.")
 
     ganancia = pedir_numero(
         "Ganancia atractiva k (sus unidades dependen del potencial)",
@@ -310,7 +534,7 @@ def editar_parametros(c, campos):
             ) / escala
 
             if nombre in ("vmax", "rueda_max") and valor > 0.50:
-                print("El maximo admitido por el SDK es 50 cm/s.")
+                fallo("El maximo admitido por el SDK es 50 cm/s.")
                 continue
 
             cambios[nombre] = valor
@@ -319,125 +543,77 @@ def editar_parametros(c, campos):
     return replace(c, **cambios).validar()
 
 
-def menu_configuracion(c):
-    while True:
-        mostrar_configuracion(c)
+def editar_control(c):
+    return editar_parametros(c, (
+        ("kv", "Ganancia de avance kv", 1),
+        ("kw", "Ganancia de giro kw", 1),
+        ("vmax", "Velocidad maxima de avance (cm/s)", 100),
+        (
+            "wmax",
+            "Velocidad maxima de giro (grados/s)",
+            180/math.pi
+        ),
+        ("rueda_max", "Velocidad maxima por rueda (cm/s)", 100),
+        ("aceleracion", "Aceleracion de avance (cm/s2)", 100),
+        ("frenado", "Frenado de aproximacion (cm/s2)", 100)
+    ))
 
-        opcion = input(
-            "Seleccione el apartado que desea editar: "
-        ).strip().lower()
 
-        if opcion == "0":
-            c = replace(
-                c,
-                orientacion_inicial=pedir_orientacion_inicial()
-            ).validar()
+def editar_llegada(c):
+    return editar_parametros(c, (
+        ("tolerancia", "Error de posicion permitido (cm)", 100),
+        (
+            "tolerancia_angular",
+            "Error angular permitido (grados)",
+            180/math.pi
+        ),
+        ("periodo", "Periodo de control (s)", 1),
+        ("tiempo_max", "Duracion maxima de la mision (s)", 1)
+    ))
 
-        elif opcion == "1":
-            c = editar_meta(c)
 
-        elif opcion == "2":
-            c = editar_potencial(c)
+def editar_robot(c):
+    robot = preguntar("Nombre Bluetooth", c.robot).strip() or c.robot
 
-        elif opcion == "3":
-            c = editar_parametros(c, (
-                ("kv", "Ganancia de avance kv", 1),
-                ("kw", "Ganancia de giro kw", 1),
-                ("vmax", "Velocidad maxima de avance (cm/s)", 100),
-                (
-                    "wmax",
-                    "Velocidad maxima de giro (grados/s)",
-                    180/math.pi
-                ),
-                ("rueda_max", "Velocidad maxima por rueda (cm/s)", 100),
-                ("aceleracion", "Aceleracion de avance (cm/s2)", 100),
-                ("frenado", "Frenado de aproximacion (cm/s2)", 100)
-            ))
-
-        elif opcion == "4":
-            c = editar_parametros(c, (
-                ("tolerancia", "Error de posicion permitido (cm)", 100),
-                (
-                    "tolerancia_angular",
-                    "Error angular permitido (grados)",
-                    180/math.pi
-                ),
-                ("periodo", "Periodo de control (s)", 1),
-                ("tiempo_max", "Duracion maxima de la mision (s)", 1)
-            ))
-
-        elif opcion == "5":
-            robot = input(
-                f"Nombre Bluetooth [{c.robot}]: "
-            ).strip() or c.robot
-
-            c = editar_parametros(replace(c, robot=robot), (
-                (
-                    "separacion_ruedas",
-                    "Separacion entre ruedas (cm)",
-                    100
-                ),
-                (
-                    "timeout_lectura",
-                    "Tiempo limite de comunicaciones (s)",
-                    1
-                )
-            ))
-
-        elif opcion == "6":
-            c = editar_repulsion(c)
-
-        elif opcion == "i":
-            print(
-                "Coloque el robot en el origen, fuera de la base "
-                "y en una zona SIN obstaculos."
-            )
-
-            confirmacion = input(
-                "Escriba SI para conectar e iniciar, "
-                "o Intro para volver: "
-            ).strip().lower()
-
-            if confirmacion == "si":
-                return c.validar()
-
-        elif opcion == "q":
-            raise SystemExit("Mision cancelada sin conectar al robot.")
-
-        else:
-            print("Seleccione 0-6, I o Q.")
+    return editar_parametros(replace(c, robot=robot), (
+        (
+            "separacion_ruedas",
+            "Separacion entre ruedas (cm)",
+            100
+        ),
+        (
+            "timeout_lectura",
+            "Tiempo limite de comunicaciones (s)",
+            1
+        )
+    ))
 
 
 def editar_repulsion(c):
     """Completar el paso 2 sin introducir obstaculos ficticios en P01."""
-    opciones = {
-        "1": "cuadratico",
-        "2": "inverso",
-        "3": "lineal_tramos",
-        "4": "propio"
-    }
-
-    print(
-        "1. Cuadratico con influencia | 2. Inverso | "
-        "3. Lineal por tramos | 4. Propio"
+    opciones = (
+        ("1", "cuadratico", "Cuadratico", "con distancia de influencia"),
+        ("2", "inverso", "Inverso", ""),
+        ("3", "lineal_tramos", "Lineal por tramos", ""),
+        ("4", "propio", "Propio", ""),
     )
-    print(
+    aviso(
         "En P01 solo se guarda la seleccion: "
         "no se leen IR ni se aplica repulsion."
     )
+    lista_opciones(opciones, c.repulsivo)
+    claves = {tecla: valor for tecla, valor, *_ in opciones}
 
     while True:
-        opcion = input(
-            f"Funcion [actual: {c.repulsivo}; Intro conserva]: "
-        ).strip()
+        opcion = preguntar("Funcion 1-4", c.repulsivo).strip()
 
-        if not opcion or opcion in opciones:
+        if not opcion or opcion in claves:
             break
 
-        print("Seleccione 1-4.")
+        fallo("Seleccione 1-4.")
 
     return editar_parametros(
-        replace(c, repulsivo=opciones.get(opcion, c.repulsivo)),
+        replace(c, repulsivo=claves.get(opcion, c.repulsivo)),
         (
             (
                 "ganancia_repulsiva",
@@ -451,6 +627,60 @@ def editar_repulsion(c):
             )
         )
     )
+
+
+EDITORES = {
+    "0": ("Orientacion inicial", editar_orientacion),
+    "1": ("Meta", editar_meta),
+    "2": ("Potencial atractivo", editar_potencial),
+    "3": ("Control", editar_control),
+    "4": ("Llegada", editar_llegada),
+    "5": ("Robot", editar_robot),
+    "6": ("Repulsion", editar_repulsion),
+}
+
+
+def menu_configuracion(c):
+    redibujar = True
+
+    while True:
+        if redibujar:
+            mostrar_configuracion(c)
+            print()
+        redibujar = True
+
+        opcion = preguntar("Opcion").strip().lower()
+
+        if opcion in EDITORES:
+            titulo, editor = EDITORES[opcion]
+            seccion(titulo)
+            if opcion != "0":
+                nota("Intro conserva el valor actual.")
+
+            try:
+                c = editor(c)
+            except ValueError as error:
+                fallo(f"Configuracion no valida: {error}")
+
+        elif opcion == "i":
+            avisos_inicio()
+
+            confirmacion = preguntar(
+                "Escriba SI para conectar e iniciar, "
+                "o Intro para volver"
+            ).strip().lower()
+
+            if confirmacion == "si":
+                return c.validar()
+
+        elif opcion == "q":
+            print()
+            aviso("Mision cancelada sin conectar al robot.")
+            raise SystemExit(1)
+
+        else:
+            fallo("Opcion no valida: elija 0-6, I o Q.")
+            redibujar = False
 
 
 def configurar():
@@ -514,10 +744,20 @@ def configurar():
 
     a = p.parse_args()
 
+    cabecera(
+        "PARTE 01 · ATRACCION",
+        "Campo de potencial atractivo sin obstaculos · Grupo 4"
+    )
+
     try:
         # La orientacion inicial se escribe siempre.
         # Los argumentos precargan el resto del menu.
+        seccion("Orientacion inicial del robot")
         orientacion_inicial = pedir_orientacion_inicial()
+
+        if a.x_cm is None or a.y_cm is None:
+            seccion("Meta")
+            nota("Intro conserva el valor propuesto.")
 
         x = (
             a.x_cm
@@ -568,16 +808,9 @@ def configurar():
     if not a.sin_menu:
         return menu_configuracion(c)
 
-    mostrar_configuracion(c)
-    print(
-        "Coloque el robot en el origen, fuera de la base "
-        "y en una zona SIN obstaculos."
-    )
-    print(
-        "La odometria se adapta al angulo inicial indicado; "
-        "no se gira para alinearla."
-    )
-    input("Pulse Intro para conectar e iniciar; Ctrl+C cancela: ")
+    mostrar_configuracion(c, menu=False)
+    avisos_inicio()
+    preguntar("Pulse Intro para conectar e iniciar; Ctrl+C cancela")
 
     return c
 
@@ -868,6 +1101,8 @@ class Registro:
             encoding="utf-8"
         )
 
+        return datos
+
 
 # MISION
 def calcular_ciclo(pose, config, rampa=None, dt=0.0):
@@ -925,7 +1160,9 @@ async def navegar(adaptador, config):
     inicio = anterior = siguiente = time.monotonic()
     motivo, error_final = "interrumpida", None
 
-    print(f"Registro de esta ejecucion: {registro.carpeta}")
+    info(f"Registro: {estilo(registro.carpeta, TENUE)}")
+    info("Navegando hacia la meta")
+    print()
 
     try:
         while True:
@@ -960,6 +1197,9 @@ async def navegar(adaptador, config):
                 estado,
                 max(0, ahora - siguiente),
                 config
+            )
+            mostrar_estado(
+                ahora - inicio, pose, error_final, estado, comando[2]
             )
 
             anterior = ahora
@@ -1001,11 +1241,12 @@ async def navegar(adaptador, config):
                     motivo
                 )
             finally:
-                registro.cerrar(
+                datos = registro.cerrar(
                     motivo,
                     time.monotonic() - inicio,
                     error_final
                 )
+                mostrar_resultado(datos, registro.carpeta)
 
     return motivo
 
@@ -1087,11 +1328,13 @@ def ejecutar(config):
     async def colision(r):
         adaptador.colision = True
         await adaptador.parar()
+        aviso("Parachoques activado: robot detenido.")
         await r.set_lights_blink_rgb(255, 0, 0)
 
     @event(robot.when_play)
     async def iniciar(r):
         try:
+            ok("Conectado")
             await adaptador.parar()
 
             await asyncio.wait_for(
@@ -1105,15 +1348,16 @@ def ejecutar(config):
             # Esta primera lectura fija el origen.
             # No se ordena ningun giro de alineacion inicial.
             await adaptador.leer_pose()
+            ok("Origen fijado en (0, 0)")
 
             await r.set_lights_on_rgb(0, 0, 255)
-            resultado = await navegar(adaptador, config)
-            print(resultado)
+            # El resultado se muestra en el resumen final de navegar.
+            await navegar(adaptador, config)
 
             await r.set_lights_on_rgb(255, 80, 0)
 
         except Exception as exc:
-            print(f"Mision detenida: {exc}")
+            fallo(f"Mision detenida: {exc}")
 
         finally:
             try:
@@ -1129,13 +1373,25 @@ def ejecutar(config):
                         r.disconnect(),
                         config.timeout_lectura
                     )
+                    info("Robot desconectado")
+                    print()
+
+    seccion("Mision")
+    info(f"Conectando por Bluetooth con {estilo(config.robot, NEGRITA)}...")
 
     # El SDK gestiona su bucle: no envolver play() en asyncio.run().
     robot.play()
 
 
 def main():
-    ejecutar(configurar())
+    try:
+        config = configurar()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        aviso("Configuracion cancelada; no se conecto al robot.")
+        raise SystemExit(1)
+
+    ejecutar(config)
 
 
 if __name__ == "__main__":

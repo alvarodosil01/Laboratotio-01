@@ -1,0 +1,11 @@
+{
+  "resultado": "RuntimeError: Parachoques activado; mision cancelada",
+  "tiempo_s": 1.273272899999938,
+  "error_final_m": 5.517439331343381,
+  "vmax_ordenada_m_s": 0.04724437000008039,
+  "ciclos_retrasados": 4,
+  "vmax_estimada_odometria_m_s": 0.029645502428573074,
+  "plazos_omitidos": 5,
+  "distancia_minima_obstaculos_m": null,
+  "nota": "Parte 01 sin IR. Velocidad ordenada y estimada por diferencias de odometria; no medida externa. Ciclo lento: dt > 1.05*Ts."
+}
