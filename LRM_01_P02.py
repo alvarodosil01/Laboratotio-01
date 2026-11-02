@@ -10,6 +10,14 @@ from datetime import datetime
 from pathlib import Path
 
 
+# Geometria nominal Create 3, en orden derecha -> izquierda del guion/SDK.
+# Fuente: iRobotEducation/create3_sim, create3.urdf.xacro (rama jazzy).
+# https://github.com/iRobotEducation/create3_sim/blob/jazzy/irobot_create_common/irobot_create_description/urdf/create3.urdf.xacro
+# Radianes LOCALES respecto al frontal. No son orientaciones globales.
+# Confirmar el orden de los indices al verificar fisicamente los sensores.
+ANGULOS_IR = (-1.309, -0.873, -0.436, 0.0, 0.436, 0.873, 1.309)
+
+
 @dataclass(frozen=True)
 class Configuracion:
     robot: str = "C3_UIEC_Grupo4"
@@ -22,7 +30,7 @@ class Configuracion:
     transicion: float = 0.30
     kv: float = 2.0
     kw: float = 1.5
-    vmax: float = 0.50  # Limite del SDK: 500 mm/s = 50 cm/s.
+    vmax: float = 0.15  # 15 cm/s para ajustar la esquiva; limite SDK 50 cm/s.
     wmax: float = 0.8
     rueda_max: float = 0.50
     aceleracion: float = 0.10  # m/s2: aumento progresivo desde reposo.
@@ -35,11 +43,13 @@ class Configuracion:
     timeout_lectura: float = 2.0
     # Repulsion ACTIVA: campos de la etapa P02.
     repulsivo: str = "khatib"
-    ganancia_repulsiva: float = 0.002
+    ganancia_repulsiva: float = 0.004
     influencia: float = 0.25
 
-    angulos_ir: tuple = ()  # Orden real del SDK, 0 delante y positivo a izquierda.
+    angulos_ir: tuple = ANGULOS_IR  # Geometria fija al chasis; no se pide por teclado.
     filtro_alpha: float = 0.5
+    confirmaciones_ir: int = 2  # Lecturas consecutivas por sensor para activar repulsion.
+    histeresis_ir: float = 0.10  # Desactivar al caer por debajo del 90% del umbral.
     seguridad: float = 0.06
     fuerza_max_sensor: float = 2.0
     calibracion_json: str = ""  # Vacio: tabla heredada de sesion 04/T03.
@@ -65,6 +75,10 @@ class Configuracion:
         validar_angulos(self.angulos_ir)
         if not 0 < self.filtro_alpha <= 1:
             raise ValueError("El filtro alpha debe cumplir 0 < alpha <= 1")
+        if not isinstance(self.confirmaciones_ir, int) or self.confirmaciones_ir < 1:
+            raise ValueError("Las confirmaciones IR deben ser un entero positivo")
+        if not 0 <= self.histeresis_ir < 1:
+            raise ValueError("La histeresis IR debe estar entre 0 y 1 (excluido)")
         if self.seguridad >= self.influencia:
             raise ValueError("La distancia de seguridad debe ser menor que la influencia")
         return self
@@ -116,7 +130,8 @@ def mostrar_configuracion(c):
     print(f"6. Repulsion: {c.repulsivo}; ganancia={c.ganancia_repulsiva:g}; influencia={c.influencia*100:g} cm")
     print(f"   Fuerza maxima por sensor={c.fuerza_max_sensor:g}")
     print(f"7. Sensores: alpha={c.filtro_alpha:g}; seguridad={c.seguridad*100:g} cm")
-    print("   Angulos SDK (grados):", [round(math.degrees(a), 2) for a in c.angulos_ir])
+    print("   Geometria IR fija al robot; acompana automaticamente su orientacion.")
+    print(f"   Deteccion: {c.confirmaciones_ir} lecturas consecutivas; histeresis={c.histeresis_ir*100:g}%")
     print("   Calibracion:", c.calibracion_json or "tabla heredada de sesion 04/T03")
     print("I. Iniciar mision con estos valores | Q. Salir sin conectar")
     print("0. Corregir la orientacion inicial introducida")
@@ -233,7 +248,7 @@ def configurar():
     p.add_argument("--transicion-cm", type=float, default=30.0)
     p.add_argument("--kv", type=float, default=2.0)
     p.add_argument("--kw", type=float, default=1.5)
-    p.add_argument("--vmax-cm-s", type=float, default=50.0)
+    p.add_argument("--vmax-cm-s", type=float, default=15.0)
     p.add_argument("--wmax-grados-s", type=float, default=math.degrees(0.8))
     p.add_argument("--rueda-max-cm-s", type=float, default=50.0)
     p.add_argument("--aceleracion-cm-s2", type=float, default=10.0)
@@ -245,10 +260,9 @@ def configurar():
     p.add_argument("--tolerancia-angular-grados", type=float, default=3.0)
     p.add_argument("--timeout-lectura", type=float, default=2.0)
     p.add_argument("--repulsivo", choices=["khatib", "polinomico"], default="khatib", help="Funcion repulsiva activa")
-    p.add_argument("--ganancia-repulsiva", "--krep", type=float, default=0.002)
+    p.add_argument("--ganancia-repulsiva", "--krep", type=float, default=0.004)
     p.add_argument("--influencia-cm", type=float, default=25)
     p.add_argument("--sin-menu", action="store_true", help="Usar argumentos y confirmacion breve")
-    p.add_argument("--angulos-grados", type=float, nargs=7, help="Angulos medidos, en orden SDK")
     p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--seguridad-cm", type=float, default=6)
     p.add_argument("--fuerza-max-sensor", type=float, default=2)
@@ -259,7 +273,6 @@ def configurar():
         orientacion_inicial = pedir_orientacion_inicial()
         x = a.x_cm if a.x_cm is not None else pedir_numero("Meta X en el escenario (cm)", 0)
         y = a.y_cm if a.y_cm is not None else pedir_numero("Meta Y en el escenario (cm)", 100)
-        angulos = pedir_angulos() if a.angulos_grados is None else tuple(math.radians(v) for v in a.angulos_grados)
         c = Configuracion(robot=a.robot, meta_x=x / 100, meta_y=y / 100,
             orientacion_inicial=orientacion_inicial,
             meta_theta=None if a.theta_grados is None else math.radians(a.theta_grados),
@@ -271,7 +284,7 @@ def configurar():
             tolerancia_angular=math.radians(a.tolerancia_angular_grados),
             timeout_lectura=a.timeout_lectura, repulsivo=a.repulsivo,
             ganancia_repulsiva=a.ganancia_repulsiva, influencia=a.influencia_cm/100,
-            angulos_ir=angulos, filtro_alpha=a.alpha, seguridad=a.seguridad_cm/100,
+            filtro_alpha=a.alpha, seguridad=a.seguridad_cm/100,
             fuerza_max_sensor=a.fuerza_max_sensor, calibracion_json=a.calibracion_json).validar()
     except (ValueError, EOFError) as error:
         p.error(str(error))
@@ -440,13 +453,46 @@ class CalibradorIR:
         raise RuntimeError("No se pudo interpolar la lectura IR")
 
 
+class DetectorIR:
+    """Confirmar presencia por sensor sin modificar las medidas de seguridad.
+
+    Entrada: dos muestras seguidas sobre el umbral calibrado de alcance.
+    Salida: intensidad inferior al umbral menos el margen de histeresis.
+    En la banda inferior, sin distancia calibrada, usar el extremo del rango
+    solo como entrada del filtro (no como una nueva medida ni extrapolacion).
+    Esto deja decaer la repulsion sin alternar presencia por pequenas oscilaciones.
+    """
+    def __init__(self, calibrador, config):
+        self.config = config
+        self.umbrales = tuple(t[-1][0] for t in calibrador.tablas)
+        self.alcance = max(calibrador.muestras)/100
+        self.cuentas = [0]*7
+        self.activas = [False]*7
+
+    def actualizar(self, intensidades, distancias):
+        confirmadas = []
+        for i, (valor, distancia, umbral) in enumerate(zip(intensidades, distancias, self.umbrales)):
+            if self.activas[i]:
+                if valor < umbral*(1-self.config.histeresis_ir):
+                    self.activas[i] = False
+                    self.cuentas[i] = 0
+            else:
+                self.cuentas[i] = self.cuentas[i]+1 if valor >= umbral else 0
+                if self.cuentas[i] >= self.config.confirmaciones_ir:
+                    self.activas[i] = True
+            confirmadas.append(
+                min(distancia, self.alcance) if self.activas[i] else math.inf)
+        return tuple(confirmadas)
+
+
 class FiltroIR:
     def __init__(self, alpha):
         self.alpha, self.anteriores = alpha, None
 
     def actualizar(self, distancias):
-        # Una deteccion nueva entra de inmediato. Una desaparicion sale de
-        # inmediato; nunca se hace aritmetica entre infinito y una distancia.
+        # Recibe detecciones ya confirmadas con histeresis. Al desactivarse un
+        # sensor, borrar su contribucion sin dejar repulsion residual.
+        # Nunca mezclar infinito y una distancia en la media exponencial.
         if self.anteriores is None:
             self.anteriores = distancias
         self.anteriores = tuple(
@@ -489,20 +535,6 @@ def validar_angulos(angulos):
         raise ValueError("Los siete angulos deben ser distintos y estar entre -90 y 90 grados")
 
 
-def pedir_angulos(actual=()):
-    print("Angulos LOCALES de los IR: 0 delante, negativos derecha, positivos izquierda.")
-    print("Introduzca los siete valores medidos en orden SDK, separados por espacios.")
-    if actual:
-        print("Intro conserva:", [math.degrees(a) for a in actual])
-    while True:
-        entrada = input("Angulos IR (grados): ").strip()
-        try:
-            valores = actual if not entrada and actual else tuple(
-                math.radians(float(v.replace(',', '.'))) for v in entrada.split())
-            validar_angulos(valores)
-            return valores
-        except ValueError as exc:
-            print(exc)
 
 
 def cargar_calibracion(config):
@@ -532,14 +564,13 @@ def editar_repulsion(c):
 
 
 def editar_sensores(c):
-    angulos = pedir_angulos(c.angulos_ir)
     alpha = pedir_numero("Filtro alpha (0 < alpha <= 1; 1 sin suavizado)", c.filtro_alpha, True)
     seguridad = pedir_numero("Distancia de parada (cm)", c.seguridad*100, True)/100
     print("JSON: {distancia_cm: [ir1,...,ir7]}; muestras medias de cada sensor.")
     ruta = input("Ruta JSON (Intro conserva; 'heredada' recupera la tabla de T03): ").strip().strip('"')
     ruta = c.calibracion_json if not ruta else "" if ruta.lower() == "heredada" else ruta
     try:
-        nuevo = replace(c, angulos_ir=angulos, filtro_alpha=alpha,
+        nuevo = replace(c, filtro_alpha=alpha,
                         seguridad=seguridad, calibracion_json=ruta).validar()
         cargar_calibracion(nuevo)
         return nuevo
@@ -556,6 +587,7 @@ class Lectura:
     intensidades: tuple
     distancias: tuple
     filtradas: tuple
+    detecciones: tuple = (False,)*7
 
 
 @dataclass(frozen=True)
@@ -618,7 +650,7 @@ class Registro:
               "F_res_x", "F_res_y", "F_res_modulo", "F_res_angulo_rad",
               "v_m_s", "w_rad_s", "v_izq_m_s", "v_der_m_s", "estado", "evento",
               "retraso_s", "v_odom_m_s", "w_odom_rad_s") + tuple(
-                  f"{prefijo}{i}" for prefijo in ("ir_", "d_m_", "d_filtrada_m_") for i in range(1, 8))
+                  f"{prefijo}{i}" for prefijo in ("ir_", "d_m_", "d_filtrada_m_", "deteccion_") for i in range(1, 8))
 
     def __init__(self, config, calibrador):
         self.carpeta = Path(__file__).resolve().parent / "datos" / Path(__file__).stem / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -652,7 +684,8 @@ class Registro:
                    *d.f_atr, *d.f_rep, *d.f_res, math.hypot(*d.f_res), math.atan2(d.f_res[1], d.f_res[0]),
                    v, w, izq, der, d.estado, d.evento, retraso, vo, wo, *lectura.intensidades,
                    *(v if math.isfinite(v) else "" for v in lectura.distancias),
-                   *(v if math.isfinite(v) else "" for v in lectura.filtradas))
+                   *(v if math.isfinite(v) else "" for v in lectura.filtradas),
+                   *(int(activa) for activa in lectura.detecciones))
         self.csv.writerow(dict(zip(self.CAMPOS, valores)))
         self.archivo.flush()
 
@@ -722,6 +755,7 @@ class Adaptador:
     def __init__(self, robot, config, calibrador):
         self.robot, self.config, self.calibrador = robot, config, calibrador
         self.filtro = FiltroIR(config.filtro_alpha)
+        self.detector = DetectorIR(calibrador, config)
         self.colision = False
         self.origen_sdk = None
 
@@ -744,8 +778,12 @@ class Adaptador:
             raise RuntimeError("Sensores IR no disponibles")
         valores = tuple(ir.sensors)
         distancias = self.calibrador.convertir(valores)
+        confirmadas = self.detector.actualizar(valores, distancias)
         self.comprobar_seguridad()
-        return Lectura(pose, tiempo_pose, valores, distancias, self.filtro.actualizar(distancias))
+        # Distancias originales conservadas para parada inmediata y limite de avance.
+        # Solo la repulsion recibe detecciones confirmadas y filtradas.
+        return Lectura(pose, tiempo_pose, valores, distancias,
+                       self.filtro.actualizar(confirmadas), tuple(self.detector.activas))
 
     async def aplicar(self, izq, der):
         self.comprobar_seguridad()
