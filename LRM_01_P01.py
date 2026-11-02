@@ -143,6 +143,7 @@ def lista_opciones(opciones, actual):
 
 _ESTADOS = {
     "NAVEGACION": ("Navegando", CIAN),
+    "FRENANDO": ("Frenando", AMARILLO),
     "ORIENTACION_FINAL": ("Orientando", AMARILLO),
     "LLEGADA": ("En meta", VERDE),
 }
@@ -181,7 +182,8 @@ def mostrar_resultado(datos, carpeta):
 
     print()
     fila("Tiempo", f"{datos['tiempo_s']:.1f} s")
-    fila("Error final (odometria)", _cm(datos["error_final_m"]))
+    fila("Error al decidir parar", _cm(datos["error_final_m"]))
+    fila("Error tras parar (odom.)", _cm(datos.get("error_tras_parada_m")))
     fila("Vmax ordenada", _cm(datos["vmax_ordenada_m_s"], "cm/s"))
     fila(
         "Vmax estimada (odometria)",
@@ -225,12 +227,17 @@ class Configuracion:
     wmax: float = 0.8
     rueda_max: float = 0.50
     aceleracion: float = 0.10  # m/s2.
-    frenado: float = 0.20  # m/s2: parametro del perfil de aproximacion.
+    frenado: float = 0.10  # m/s2: parametro del perfil de aproximacion.
 
     separacion_ruedas: float = 0.235  # Medir antes de validar.
     tolerancia: float = 0.05
     tolerancia_angular: float = math.radians(3)
-    periodo: float = 0.10
+    # Periodo real medido: leer pose + enviar ruedas por Bluetooth
+    # tarda 0.20-0.27 s, asi que 0.10 s no se cumplia nunca.
+    periodo: float = 0.25
+    # Retraso entre la pose leida y el efecto de la orden en el robot
+    # (odometria atrasada + Bluetooth). Calibrar con error_tras_parada.
+    latencia: float = 0.30
     tiempo_max: float = 120.0
     timeout_lectura: float = 2.0
 
@@ -250,7 +257,7 @@ class Configuracion:
             "rueda_max", "separacion_ruedas", "tolerancia",
             "tolerancia_angular", "periodo", "tiempo_max",
             "timeout_lectura", "ganancia_repulsiva", "influencia",
-            "aceleracion", "frenado"
+            "aceleracion", "frenado", "latencia"
         ):
             if getattr(self, nombre) <= 0:
                 raise ValueError(f"{nombre}: debe ser mayor que cero")
@@ -393,6 +400,7 @@ def mostrar_configuracion(c, menu=True):
         ),
         _junto(
             f"periodo {c.periodo:g} s",
+            f"latencia {c.latencia:g} s",
             f"tiempo maximo {c.tiempo_max:g} s"
         )
     )
@@ -568,6 +576,7 @@ def editar_llegada(c):
             180/math.pi
         ),
         ("periodo", "Periodo de control (s)", 1),
+        ("latencia", "Latencia de parada anticipada (s)", 1),
         ("tiempo_max", "Duracion maxima de la mision (s)", 1)
     ))
 
@@ -721,10 +730,16 @@ def configurar():
     )
     p.add_argument("--rueda-max-cm-s", type=float, default=50.0)
     p.add_argument("--aceleracion-cm-s2", type=float, default=10.0)
-    p.add_argument("--frenado-cm-s2", type=float, default=20.0)
+    p.add_argument("--frenado-cm-s2", type=float, default=10.0)
     p.add_argument("--separacion-cm", type=float, default=23.5)
     p.add_argument("--tolerancia-cm", type=float, default=5.0)
-    p.add_argument("--periodo", type=float, default=0.1)
+    p.add_argument("--periodo", type=float, default=0.25)
+    p.add_argument(
+        "--latencia",
+        type=float,
+        default=0.30,
+        help="Retraso (s) usado para anticipar la parada"
+    )
     p.add_argument("--tiempo-max", type=float, default=120.0)
     p.add_argument("--tolerancia-angular-grados", type=float, default=3.0)
     p.add_argument("--timeout-lectura", type=float, default=2.0)
@@ -794,6 +809,7 @@ def configurar():
             frenado=a.frenado_cm_s2/100,
             tolerancia=a.tolerancia_cm/100,
             periodo=a.periodo,
+            latencia=a.latencia,
             tiempo_max=a.tiempo_max,
             tolerancia_angular=math.radians(a.tolerancia_angular_grados),
             timeout_lectura=a.timeout_lectura,
@@ -864,13 +880,14 @@ def velocidades(fx, fy, distancia, config):
         min(config.wmax, config.kw*error)
     )
 
-    # Reservar distancia para un ciclo de avance y el frenado:
-    # v*Ts + v^2/(2*b) <= distancia a la meta.
+    # Reservar distancia para lo que se avanza sin poder corregir
+    # (un ciclo + la latencia) y para el frenado:
+    # v*(Ts + L) + v^2/(2*b) <= distancia a la meta.
     #
     # Usar la distancia completa evita tender a velocidad cero ANTES
     # de entrar en la tolerancia. Al entrar, calcular_ciclo ordena parar.
     disponible = max(0.0, distancia)
-    bt = config.frenado * config.periodo
+    bt = config.frenado * (config.periodo + config.latencia)
 
     limite_frenado = (
         math.sqrt(bt*bt + 2*config.frenado*disponible) - bt
@@ -993,6 +1010,7 @@ class Registro:
     )
 
     def __init__(self, config):
+        self.config = config
         self.carpeta = (
             Path(__file__).resolve().parent
             / "datos"
@@ -1077,13 +1095,25 @@ class Registro:
         })
         self.archivo.flush()
 
-    def cerrar(self, motivo, tiempo, error):
+    def cerrar(self, motivo, tiempo, error, pose_parada=None):
         self.archivo.close()
+
+        error_parada = None
+        if pose_parada is not None:
+            error_parada = math.hypot(
+                self.config.meta_x - pose_parada.x,
+                self.config.meta_y - pose_parada.y
+            )
 
         datos = {
             "resultado": motivo,
             "tiempo_s": tiempo,
             "error_final_m": error,
+            # Medido 0.6 s despues de parar: incluye el deslizamiento.
+            "error_tras_parada_m": error_parada,
+            "pose_tras_parada": (
+                None if pose_parada is None else asdict(pose_parada)
+            ),
             "vmax_ordenada_m_s": self.vmax,
             "ciclos_retrasados": self.ciclos_tarde,
             "vmax_estimada_odometria_m_s": self.vmax_odom,
@@ -1114,7 +1144,19 @@ def calcular_ciclo(pose, config, rampa=None, dt=0.0):
     u, fx, fy = atractivo(dx, dy, config)
     fuerza = a_local(fx, fy, pose.theta)
 
-    if distancia <= config.tolerancia:
+    # La pose llega atrasada y la orden tarda en aplicarse: el robot
+    # recorre aun unos v*latencia. Se resta para parar a tiempo.
+    v_previa = rampa.actual if rampa is not None else 0.0
+    distancia_prevista = distancia - v_previa*config.latencia
+
+    if v_previa > 0 and distancia_prevista <= config.tolerancia:
+        # Parada anticipada. La llegada se confirma en el ciclo
+        # siguiente, ya con el robot parado; si se quedo corto,
+        # vuelve a navegar despacio desde la rampa.
+        v, w = 0, 0
+        estado = "FRENANDO"
+
+    elif distancia <= config.tolerancia:
         error = (
             0
             if config.meta_theta is None
@@ -1138,6 +1180,11 @@ def calcular_ciclo(pose, config, rampa=None, dt=0.0):
 
     else:
         v, w = velocidades(*fuerza, distancia, config)
+
+        if fuerza[0] < 0 and distancia < 2*config.tolerancia:
+            # Meta detras y muy cerca: se ha pasado de largo.
+            # Girar sin avanzar en vez de alejarse trazando una curva.
+            v = 0
 
         if rampa is not None:
             v = rampa.limitar(v, dt, config)
@@ -1232,8 +1279,18 @@ async def navegar(adaptador, config):
     finally:
         # Parar antes de escribir el resumen.
         # Intentar cerrar el registro aunque falle la parada por Bluetooth.
+        pose_parada = None
         try:
             await adaptador.parar()
+
+            if motivo == "meta_alcanzada":
+                # Esperar a que el robot se detenga del todo y releer:
+                # asi se mide lo que realmente se paso o se quedo corto.
+                await asyncio.sleep(0.6)
+                try:
+                    pose_parada = await adaptador.leer_pose()
+                except Exception as exc:
+                    aviso(f"No se pudo leer la pose tras parar: {exc}")
         finally:
             try:
                 registro.evento(
@@ -1244,7 +1301,8 @@ async def navegar(adaptador, config):
                 datos = registro.cerrar(
                     motivo,
                     time.monotonic() - inicio,
-                    error_final
+                    error_final,
+                    pose_parada
                 )
                 mostrar_resultado(datos, registro.carpeta)
 
