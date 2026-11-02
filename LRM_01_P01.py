@@ -1411,10 +1411,10 @@ if __name__ == "__main__":
 #
 # | Potencial  | Ganancia k | Transicion (cm) | Tiempo (s) | Error odom. (cm) | Error real (cm) | Vmax odom. (cm/s) |
 # |------------|------------|-----------------|------------|------------------|-----------------|-------------------|
-# | Cuadratico |            | No aplica       |            |                  |                 |                   |
-# | Conico     |            | No aplica       |            |                  |                 |                   |
-# | Hibrido    |            |                 |            |                  |                 |                   |
-# | Suave      |            |                 |            |                  |                 |                   |
+# | Cuadratico |     0,25   | No aplica       |    24.2    |    4.9           |    1            |     37.4              |
+# | Conico     |     0,7    | No aplica       |   22.6     |    1.8           |   2.3           |     42.4              |
+# | Hibrido    |      0,7   |   30              |    22.6    |     0.6          |    2.4          |      44.7            |
+# | Suave      |     0,8    |   30            |     22     |     1.8          |    1.5          |       44.4            |
 #
 # OBSERVACIONES
 # Cuadratico:
