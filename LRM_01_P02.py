@@ -1,19 +1,14 @@
-"""Parte 02: programa autonomo del Grupo 4.
-Percepcion, potenciales, control, supervisor y registro separados internamente.
-Implementacion pendiente de calibracion y validacion fisica, sin simulaciones.
-"""
+"""Parte 02: atraccion y repulsion con siete IR. Grupo 4. Programa autonomo organizado por responsabilidades."""
 import argparse
 import asyncio
 import csv
 import json
 import math
 import time
-from collections import deque
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime
 from pathlib import Path
 
-PARTE = 2
 
 @dataclass(frozen=True)
 class Configuracion:
@@ -21,20 +16,33 @@ class Configuracion:
     meta_x: float = 0.0
     meta_y: float = 1.0
     meta_theta: float | None = None
+    orientacion_inicial: float = math.pi/2  # Respecto a los ejes FIJOS del escenario.
     potencial: str = "hibrido"
     ganancia: float = 1.0
     transicion: float = 0.30
-    kv: float = 0.4
+    kv: float = 2.0
     kw: float = 1.5
-    vmax: float = 0.05
+    vmax: float = 0.50  # Limite del SDK: 500 mm/s = 50 cm/s.
     wmax: float = 0.8
-    rueda_max: float = 0.10
+    rueda_max: float = 0.50
+    aceleracion: float = 0.10  # m/s2: aumento progresivo desde reposo.
+    frenado: float = 0.20  # m/s2: parametro del perfil de aproximacion.
     separacion_ruedas: float = 0.235  # Heredada de T03: medir antes de validar.
     tolerancia: float = 0.05
     tolerancia_angular: float = math.radians(3)
     periodo: float = 0.10
     tiempo_max: float = 120.0
     timeout_lectura: float = 2.0
+    # Repulsion ACTIVA: campos de la etapa P02.
+    repulsivo: str = "khatib"
+    ganancia_repulsiva: float = 0.002
+    influencia: float = 0.25
+
+    angulos_ir: tuple = ()  # Orden real del SDK, 0 delante y positivo a izquierda.
+    filtro_alpha: float = 0.5
+    seguridad: float = 0.06
+    fuerza_max_sensor: float = 2.0
+    calibracion_json: str = ""  # Vacio: tabla heredada de sesion 04/T03.
 
     def validar(self):
         for nombre, valor in asdict(self).items():
@@ -42,14 +50,242 @@ class Configuracion:
                 raise ValueError(f"{nombre}: debe ser finito")
         for nombre in ("ganancia", "transicion", "kv", "kw", "vmax", "wmax",
                        "rueda_max", "separacion_ruedas", "tolerancia",
-                       "tolerancia_angular", "periodo", "tiempo_max", "timeout_lectura"):
+                       "tolerancia_angular", "periodo", "tiempo_max", "timeout_lectura",
+                       "ganancia_repulsiva", "influencia", "aceleracion", "frenado", "seguridad", "fuerza_max_sensor"):
             if getattr(self, nombre) <= 0:
                 raise ValueError(f"{nombre}: debe ser mayor que cero")
         if self.potencial not in ("cuadratico", "conico", "hibrido", "suave"):
             raise ValueError("Potencial desconocido")
         if not self.robot.strip():
             raise ValueError("Falta el nombre Bluetooth")
+        if self.vmax > 0.50 or self.rueda_max > 0.50:
+            raise ValueError("El SDK limita el avance y cada rueda a 50 cm/s")
+        if self.repulsivo not in ("khatib", "polinomico"):
+            raise ValueError("Seleccion repulsiva desconocida")
+        validar_angulos(self.angulos_ir)
+        if not 0 < self.filtro_alpha <= 1:
+            raise ValueError("El filtro alpha debe cumplir 0 < alpha <= 1")
+        if self.seguridad >= self.influencia:
+            raise ValueError("La distancia de seguridad debe ser menor que la influencia")
         return self
+
+
+def pedir_numero(texto, actual, positivo=False):
+    """Aceptar Intro para conservar el valor y repetir si la entrada no es valida."""
+    while True:
+        entrada = input(f"{texto} [{actual:g}]: ").strip().replace(",", ".")
+        try:
+            valor = actual if not entrada else float(entrada)
+            if not math.isfinite(valor) or (positivo and valor <= 0):
+                raise ValueError
+            return valor
+        except ValueError:
+            print("Introduzca un numero finito" + (" mayor que cero." if positivo else "."))
+
+
+def pedir_orientacion_inicial():
+    """Exigir un angulo escrito; no suponer que el robot mira hacia +Y."""
+    print("Ejes fijos del suelo: 0 grados = +X; 90 = +Y; 180 = -X; -90 = -Y.")
+    print("El robot empieza en (0, 0), pero puede mirar en cualquier direccion.")
+    while True:
+        entrada = input("Escriba la orientacion INICIAL del robot (grados): ").strip()
+        try:
+            valor = float(entrada.replace(",", "."))
+            if not math.isfinite(valor):
+                raise ValueError
+            return math.radians(valor)
+        except ValueError:
+            print("Es obligatorio escribir un angulo finito, por ejemplo 45 o -90.")
+
+
+def mostrar_configuracion(c):
+    print("\n--- P02: configuracion de la mision ---")
+    print("Origen: (0, 0) inicial. X e Y son ejes fijos marcados en el suelo.")
+    print(f"   Orientacion INICIAL: {math.degrees(c.orientacion_inicial):g} grados")
+    print(f"1. Meta: X={c.meta_x*100:g} cm, Y={c.meta_y*100:g} cm")
+    orientacion = "sin orientacion final" if c.meta_theta is None else f"{math.degrees(c.meta_theta):g} grados"
+    print(f"   Orientacion FINAL: {orientacion} (90 grados = direccion +Y)")
+    print(f"2. Potencial: {c.potencial}; ganancia={c.ganancia:g}; transicion={c.transicion*100:g} cm")
+    print(f"3. Control: kv={c.kv:g}, kw={c.kw:g}; avance max={c.vmax*100:g} cm/s")
+    print(f"   Giro max={math.degrees(c.wmax):g} grados/s; rueda max={c.rueda_max*100:g} cm/s")
+    print(f"   Aceleracion={c.aceleracion*100:g} cm/s2; frenado={c.frenado*100:g} cm/s2")
+    print(f"4. Llegada: error <= {c.tolerancia*100:g} cm; error angular <= {math.degrees(c.tolerancia_angular):g} grados")
+    print(f"   Periodo={c.periodo:g} s; tiempo maximo={c.tiempo_max:g} s")
+    print(f"5. Robot: {c.robot}; separacion de ruedas={c.separacion_ruedas*100:g} cm")
+    print(f"   Tiempo limite de comunicaciones={c.timeout_lectura:g} s")
+    print(f"6. Repulsion: {c.repulsivo}; ganancia={c.ganancia_repulsiva:g}; influencia={c.influencia*100:g} cm")
+    print(f"   Fuerza maxima por sensor={c.fuerza_max_sensor:g}")
+    print(f"7. Sensores: alpha={c.filtro_alpha:g}; seguridad={c.seguridad*100:g} cm")
+    print("   Angulos SDK (grados):", [round(math.degrees(a), 2) for a in c.angulos_ir])
+    print("   Calibracion:", c.calibracion_json or "tabla heredada de sesion 04/T03")
+    print("I. Iniciar mision con estos valores | Q. Salir sin conectar")
+    print("0. Corregir la orientacion inicial introducida")
+
+
+def editar_meta(c):
+    x = pedir_numero("Meta X (cm)", c.meta_x*100)/100
+    y = pedir_numero("Meta Y (cm)", c.meta_y*100)/100
+    print("Rumbo absoluto del escenario: 0 = +X, 90 = +Y, 180 = -X, -90 = -Y.")
+    while True:
+        valor = input("Orientacion final en grados (Intro conserva; 'no' desactiva): ").strip().lower()
+        try:
+            theta = c.meta_theta if not valor else None if valor == "no" else math.radians(float(valor.replace(",", ".")))
+            if theta is not None and not math.isfinite(theta):
+                raise ValueError
+            return replace(c, meta_x=x, meta_y=y, meta_theta=theta).validar()
+        except ValueError:
+            print("Introduzca un angulo finito o 'no'.")
+
+
+def editar_potencial(c):
+    opciones = {"1": "cuadratico", "2": "conico", "3": "hibrido", "4": "suave"}
+    print("1. Cuadratico: atraccion proporcional a la distancia.")
+    print("2. Conico: magnitud constante fuera de la meta.")
+    print("3. Hibrido: cuadratico cerca, conico lejos.")
+    print("4. Propio (suave): transicion gradual hasta una atraccion limitada.")
+    while True:
+        entrada = input(f"Potencial 1-4 [actual: {c.potencial}; Intro conserva]: ").strip()
+        if not entrada or entrada in opciones:
+            potencial = opciones.get(entrada, c.potencial)
+            break
+        print("Elija una opcion del 1 al 4.")
+    ganancia = pedir_numero("Ganancia atractiva k (sus unidades dependen del potencial)", c.ganancia, True)
+    transicion = c.transicion
+    if potencial in ("hibrido", "suave"):
+        transicion = pedir_numero("Distancia de transicion atractiva (cm)", c.transicion*100, True)/100
+    return replace(c, potencial=potencial, ganancia=ganancia, transicion=transicion).validar()
+
+
+def editar_parametros(c, campos):
+    """La escala convierte unidades internas a las unidades mostradas al usuario."""
+    cambios = {}
+    for nombre, texto, escala in campos:
+        while True:
+            valor = pedir_numero(texto, getattr(c, nombre)*escala, True)/escala
+            if nombre in ("vmax", "rueda_max") and valor > 0.50:
+                print("El maximo admitido por el SDK es 50 cm/s.")
+                continue
+            cambios[nombre] = valor
+            break
+    try:
+        return replace(c, **cambios).validar()
+    except ValueError as exc:
+        print(f"No se guardaron los cambios: {exc}")
+        return c
+
+
+def menu_configuracion(c):
+    while True:
+        mostrar_configuracion(c)
+        opcion = input("Seleccione el apartado que desea editar: ").strip().lower()
+        if opcion == "0":
+            c = replace(c, orientacion_inicial=pedir_orientacion_inicial()).validar()
+        elif opcion == "1":
+            c = editar_meta(c)
+        elif opcion == "2":
+            c = editar_potencial(c)
+        elif opcion == "3":
+            c = editar_parametros(c, (
+                ("kv", "Ganancia de avance kv", 1), ("kw", "Ganancia de giro kw", 1),
+                ("vmax", "Velocidad maxima de avance (cm/s)", 100),
+                ("wmax", "Velocidad maxima de giro (grados/s)", 180/math.pi),
+                ("rueda_max", "Velocidad maxima por rueda (cm/s)", 100),
+                ("aceleracion", "Aceleracion de avance (cm/s2)", 100),
+                ("frenado", "Frenado de aproximacion (cm/s2)", 100)))
+        elif opcion == "4":
+            c = editar_parametros(c, (
+                ("tolerancia", "Error de posicion permitido (cm)", 100),
+                ("tolerancia_angular", "Error angular permitido (grados)", 180/math.pi),
+                ("periodo", "Periodo de control (s)", 1),
+                ("tiempo_max", "Duracion maxima de la mision (s)", 1)))
+        elif opcion == "5":
+            robot = input(f"Nombre Bluetooth [{c.robot}]: ").strip() or c.robot
+            c = editar_parametros(replace(c, robot=robot), (
+                ("separacion_ruedas", "Separacion entre ruedas (cm)", 100),
+                ("timeout_lectura", "Tiempo limite de comunicaciones (s)", 1)))
+        elif opcion == "6":
+            c = editar_repulsion(c)
+        elif opcion == "7":
+            c = editar_sensores(c)
+        elif opcion == "i":
+            try:
+                calibrador = cargar_calibracion(c)
+            except (ValueError, TypeError, OSError) as exc:
+                print(f"Revise la calibracion y los parametros: {exc}")
+                continue
+            print("Coloque el robot en el origen indicado y verifique el escenario de P02.")
+            if input("Escriba SI para conectar e iniciar, o Intro para volver: ").strip().lower() == "si":
+                return c.validar(), calibrador
+        elif opcion == "q":
+            raise SystemExit("Mision cancelada sin conectar al robot.")
+        else:
+            print("Seleccione 0-7, I o Q.")
+
+
+def configurar():
+    p = argparse.ArgumentParser(description="Parte 02: campos atractivos y repulsivos con siete IR.")
+    p.add_argument("--robot", default="C3_UIEC_Grupo4")
+    p.add_argument("--x-cm", type=float, help="Meta X respecto al origen odometrico")
+    p.add_argument("--y-cm", type=float, help="Meta Y en los ejes fijos del escenario")
+    p.add_argument("--theta-grados", type=float, help="Orientacion final opcional")
+    p.add_argument("--potencial", choices=["cuadratico", "conico", "hibrido", "suave"], default="hibrido")
+    p.add_argument("--ganancia", type=float, default=1.0)
+    p.add_argument("--transicion-cm", type=float, default=30.0)
+    p.add_argument("--kv", type=float, default=2.0)
+    p.add_argument("--kw", type=float, default=1.5)
+    p.add_argument("--vmax-cm-s", type=float, default=50.0)
+    p.add_argument("--wmax-grados-s", type=float, default=math.degrees(0.8))
+    p.add_argument("--rueda-max-cm-s", type=float, default=50.0)
+    p.add_argument("--aceleracion-cm-s2", type=float, default=10.0)
+    p.add_argument("--frenado-cm-s2", type=float, default=20.0)
+    p.add_argument("--separacion-cm", type=float, default=23.5)
+    p.add_argument("--tolerancia-cm", type=float, default=5.0)
+    p.add_argument("--periodo", type=float, default=0.1)
+    p.add_argument("--tiempo-max", type=float, default=120.0)
+    p.add_argument("--tolerancia-angular-grados", type=float, default=3.0)
+    p.add_argument("--timeout-lectura", type=float, default=2.0)
+    p.add_argument("--repulsivo", choices=["khatib", "polinomico"], default="khatib", help="Funcion repulsiva activa")
+    p.add_argument("--ganancia-repulsiva", "--krep", type=float, default=0.002)
+    p.add_argument("--influencia-cm", type=float, default=25)
+    p.add_argument("--sin-menu", action="store_true", help="Usar argumentos y confirmacion breve")
+    p.add_argument("--angulos-grados", type=float, nargs=7, help="Angulos medidos, en orden SDK")
+    p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument("--seguridad-cm", type=float, default=6)
+    p.add_argument("--fuerza-max-sensor", type=float, default=2)
+    p.add_argument("--calibracion-json", default="", help="Tabla {distancia_cm: [ir1,...,ir7]}")
+    a = p.parse_args()
+    try:
+        # Los argumentos precargan el menu; la conversion a SI se realiza aqui.
+        orientacion_inicial = pedir_orientacion_inicial()
+        x = a.x_cm if a.x_cm is not None else pedir_numero("Meta X en el escenario (cm)", 0)
+        y = a.y_cm if a.y_cm is not None else pedir_numero("Meta Y en el escenario (cm)", 100)
+        angulos = pedir_angulos() if a.angulos_grados is None else tuple(math.radians(v) for v in a.angulos_grados)
+        c = Configuracion(robot=a.robot, meta_x=x / 100, meta_y=y / 100,
+            orientacion_inicial=orientacion_inicial,
+            meta_theta=None if a.theta_grados is None else math.radians(a.theta_grados),
+            potencial=a.potencial, ganancia=a.ganancia, transicion=a.transicion_cm / 100,
+            kv=a.kv, kw=a.kw, vmax=a.vmax_cm_s / 100, wmax=math.radians(a.wmax_grados_s),
+            rueda_max=a.rueda_max_cm_s / 100, separacion_ruedas=a.separacion_cm / 100,
+            aceleracion=a.aceleracion_cm_s2/100, frenado=a.frenado_cm_s2/100,
+            tolerancia=a.tolerancia_cm / 100, periodo=a.periodo, tiempo_max=a.tiempo_max,
+            tolerancia_angular=math.radians(a.tolerancia_angular_grados),
+            timeout_lectura=a.timeout_lectura, repulsivo=a.repulsivo,
+            ganancia_repulsiva=a.ganancia_repulsiva, influencia=a.influencia_cm/100,
+            angulos_ir=angulos, filtro_alpha=a.alpha, seguridad=a.seguridad_cm/100,
+            fuerza_max_sensor=a.fuerza_max_sensor, calibracion_json=a.calibracion_json).validar()
+    except (ValueError, EOFError) as error:
+        p.error(str(error))
+    if not a.sin_menu:
+        return menu_configuracion(c)
+    try:
+        calibrador = cargar_calibracion(c)
+    except (ValueError, TypeError, OSError) as exc:
+        p.error(str(exc))
+    mostrar_configuracion(c)
+    print("Coloque el robot en el origen, fuera de la base, en el escenario de P02.")
+    print("La odometria se adapta al angulo inicial indicado; no se gira para alinearla.")
+    input("Pulse Intro para conectar e iniciar; Ctrl+C cancela: ")
+    return c, calibrador
 
 
 @dataclass(frozen=True)
@@ -63,17 +299,55 @@ def angulo_corto(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
-def velocidades(fx, fy, distancia, config):
-    """Avance y giro simultaneos. Reducir avance si el objetivo queda de lado.
+def pose_en_escenario(pose_sdk, origen_sdk, orientacion_inicial):
+    """Trasladar y rotar la odometria a los ejes fijos elegidos por el equipo.
 
-    Si queda detras, v=0 y el mismo controlador sigue calculando w; no se
-    ejecuta una maniobra turn_left seguida de move. El limite por distancia
-    evita atravesar la meta con el potencial conico de fuerza constante.
+    La primera pose define (0, 0). El desfase angular se conserva toda la
+    mision: ni los ejes ni la meta giran cuando gira el robot. No mueve motores.
+    Todas las entradas y salidas estan en metros y radianes.
+    """
+    desfase = orientacion_inicial-origen_sdk.theta
+    dx, dy = pose_sdk.x-origen_sdk.x, pose_sdk.y-origen_sdk.y
+    c, s = math.cos(desfase), math.sin(desfase)
+    return Pose(c*dx-s*dy, s*dx+c*dy,
+                angulo_corto(pose_sdk.theta+desfase))
+
+
+def velocidades(fx, fy, distancia, config):
+    """Avance y giro simultaneos, incluso cuando la meta queda detras.
+
+    La atenuacion angular positiva reduce el avance en curvas cerradas sin
+    convertir la navegacion en un giro parado seguido de avance. El limite
+    por distancia suaviza la llegada incluso con el potencial conico.
     """
     error = math.atan2(fy, fx)
     w = max(-config.wmax, min(config.wmax, config.kw*error))
-    v = min(config.vmax, config.kv*math.hypot(fx, fy), config.kv*distancia)
-    return v*max(0.0, math.cos(error)), w
+    # Reservar distancia para un ciclo de avance y el frenado:
+    # v*Ts + v^2/(2*b) <= distancia a la meta. Usar la distancia completa
+    # evita tender a velocidad cero ANTES de entrar en la tolerancia.
+    # Al entrar en ella, calcular_ciclo ordena parar.
+    disponible = max(0.0, distancia)
+    bt = config.frenado*config.periodo
+    limite_frenado = math.sqrt(bt*bt+2*config.frenado*disponible)-bt
+    v = min(config.vmax, config.kv*math.hypot(fx, fy),
+            config.kv*distancia, limite_frenado)
+    return v/(1.0+error*error), w
+
+
+class RampaAvance:
+    """Memoria de la velocidad efectiva ordenada; independiente del SDK.
+
+    Limita los aumentos. Una reduccion por curva, llegada o seguridad se aplica
+    inmediatamente: no se conserva una velocidad superior al limite calculado.
+    El parametro de frenado es un modelo que debe contrastarse con el robot.
+    """
+    def __init__(self):
+        self.actual = 0.0
+
+    def limitar(self, objetivo, dt, config):
+        # Un retraso Bluetooth no debe provocar un salto grande al reanudar.
+        dt = max(0.0, min(dt, config.periodo))
+        return min(objetivo, self.actual+config.aceleracion*dt)
 
 
 def ruedas(v, w, config):
@@ -118,130 +392,6 @@ def a_local(fx, fy, theta):
     return c*fx+s*fy, -s*fx+c*fy
 
 
-# CONFIGURACION DE LA NAVEGACION CON OBSTACULOS
-@dataclass(frozen=True)
-class ConfiguracionNavegacion(Configuracion):
-    angulos_ir: tuple = ()  # Radianes, en el orden REAL del vector del SDK.
-    repulsivo: str = "khatib"
-    krep: float = 0.002
-    influencia: float = 0.25
-    fuerza_max_sensor: float = 2.0
-    filtro_alpha: float = 0.5
-    seguridad: float = 0.06
-    ventana: float = 4.0
-    progreso_min: float = 0.02
-    movimiento_min: float = 0.03
-    fuerza_min: float = 0.02
-    escape: str = "tangencial"
-    duracion_escape: float = 8.0
-    ganancia_escape: float = 0.4
-    distancia_submeta: float = 0.35
-    max_escapes: int = 4
-
-    def validar(self):
-        super().validar()
-        if len(self.angulos_ir) != 7 or not all(math.isfinite(x) for x in self.angulos_ir):
-            raise ValueError("Introduzca los 7 angulos IR verificados, en orden del SDK")
-        if any(abs(a) > math.pi/2+1e-6 for a in self.angulos_ir):
-            raise ValueError("Los sensores frontales deben estar entre -90 y +90 grados")
-        if len(set(self.angulos_ir)) != 7:
-            raise ValueError("Cada sensor debe tener un angulo distinto")
-        if self.repulsivo not in ("khatib", "polinomico"):
-            raise ValueError("Potencial repulsivo desconocido")
-        if self.escape not in ("ninguno", "tangencial", "submeta"):
-            raise ValueError("Estrategia de escape desconocida")
-        for nombre in ("krep", "influencia", "fuerza_max_sensor", "seguridad", "ventana",
-                       "progreso_min", "movimiento_min", "fuerza_min", "duracion_escape",
-                       "ganancia_escape", "distancia_submeta"):
-            if getattr(self, nombre) <= 0:
-                raise ValueError(f"{nombre} debe ser positivo")
-        if not 0 < self.filtro_alpha <= 1:
-            raise ValueError("alpha debe estar entre 0 (excluido) y 1")
-        if not 0.05 < self.seguridad < self.influencia <= 0.25:
-            raise ValueError("La tabla heredada exige 5 cm < seguridad < influencia <= 25 cm")
-        if self.ventana <= self.periodo or self.duracion_escape <= self.periodo:
-            raise ValueError("Ventana y escape deben superar el periodo de control")
-        if self.max_escapes < 1:
-            raise ValueError("Debe permitirse al menos un intento de escape")
-        return self
-
-
-def configurar():
-    p = argparse.ArgumentParser(description=f"Parte {PARTE:02}: campos de potencial y control continuo")
-    p.add_argument("--robot", default="C3_UIEC_Grupo4")
-    p.add_argument("--x-cm", type=float)
-    p.add_argument("--y-cm", type=float)
-    p.add_argument("--theta-grados", type=float)
-    p.add_argument("--potencial", choices=["cuadratico", "conico", "hibrido", "suave"], default="hibrido")
-    p.add_argument("--ganancia", type=float, default=1.0)
-    p.add_argument("--transicion-cm", type=float, default=30)
-    p.add_argument("--kv", type=float, default=0.4)
-    p.add_argument("--kw", type=float, default=1.5)
-    p.add_argument("--vmax-cm-s", type=float, default=5)
-    p.add_argument("--wmax-grados-s", type=float, default=math.degrees(0.8))
-    p.add_argument("--rueda-max-cm-s", type=float, default=10)
-    p.add_argument("--separacion-cm", type=float, default=23.5)
-    p.add_argument("--tolerancia-cm", type=float, default=5)
-    p.add_argument("--periodo", type=float, default=0.1)
-    p.add_argument("--tiempo-max", type=float, default=120)
-    p.add_argument("--angulos-grados", type=float, nargs=7,
-                   help="7 angulos medidos en orden SDK: 0 delante, positivos a izquierda")
-    p.add_argument("--repulsivo", choices=["khatib", "polinomico"], default="khatib")
-    p.add_argument("--krep", type=float, default=0.002)
-    p.add_argument("--influencia-cm", type=float, default=25)
-    p.add_argument("--fuerza-max-sensor", type=float, default=2)
-    p.add_argument("--alpha", type=float, default=0.5)
-    p.add_argument("--seguridad-cm", type=float, default=6)
-    p.add_argument("--calibracion-json", type=Path,
-                   help="Tabla opcional {distancia_cm: [s1,...,s7]}, entre 5 y 25 cm")
-    if PARTE == 3:
-        p.add_argument("--escape", choices=["ninguno", "tangencial", "submeta"], default="tangencial")
-        p.add_argument("--ventana", type=float, default=4)
-        p.add_argument("--progreso-cm", type=float, default=2)
-        p.add_argument("--movimiento-cm", type=float, default=3)
-        p.add_argument("--fuerza-min", type=float, default=0.02)
-        p.add_argument("--duracion-escape", type=float, default=8)
-        p.add_argument("--ganancia-escape", type=float, default=0.4)
-        p.add_argument("--submeta-cm", type=float, default=35)
-        p.add_argument("--max-escapes", type=int, default=4)
-    a = p.parse_args()
-    try:
-        x = a.x_cm if a.x_cm is not None else float(input("Meta X (cm): "))
-        y = a.y_cm if a.y_cm is not None else float(input("Meta Y (cm): "))
-        angulos = a.angulos_grados
-        if angulos is None:
-            angulos = [float(v) for v in input("7 angulos IR verificados, separados por espacios (grados): ").split()]
-        c = ConfiguracionNavegacion(robot=a.robot, meta_x=x/100, meta_y=y/100,
-            meta_theta=None if a.theta_grados is None else math.radians(a.theta_grados),
-            potencial=a.potencial, ganancia=a.ganancia, transicion=a.transicion_cm/100,
-            kv=a.kv, kw=a.kw, vmax=a.vmax_cm_s/100, wmax=math.radians(a.wmax_grados_s),
-            rueda_max=a.rueda_max_cm_s/100, separacion_ruedas=a.separacion_cm/100,
-            tolerancia=a.tolerancia_cm/100, periodo=a.periodo, tiempo_max=a.tiempo_max,
-            angulos_ir=tuple(math.radians(v) for v in angulos), repulsivo=a.repulsivo,
-            krep=a.krep, influencia=a.influencia_cm/100, fuerza_max_sensor=a.fuerza_max_sensor,
-            filtro_alpha=a.alpha, seguridad=a.seguridad_cm/100,
-            escape=getattr(a, "escape", "ninguno"), ventana=getattr(a, "ventana", 4),
-            progreso_min=getattr(a, "progreso_cm", 2)/100,
-            movimiento_min=getattr(a, "movimiento_cm", 3)/100,
-            fuerza_min=getattr(a, "fuerza_min", 0.02),
-            duracion_escape=getattr(a, "duracion_escape", 8),
-            ganancia_escape=getattr(a, "ganancia_escape", 0.4),
-            distancia_submeta=getattr(a, "submeta_cm", 35)/100,
-            max_escapes=getattr(a, "max_escapes", 4)).validar()
-        tabla = MUESTRAS_IR
-        if a.calibracion_json:
-            tabla = {float(k): v for k, v in json.loads(a.calibracion_json.read_text(encoding="utf-8")).items()}
-        calibrador = CalibradorIR(tabla)
-    except (ValueError, TypeError, EOFError, OSError) as exc:
-        p.error(str(exc))
-    print(f"P{PARTE:02} | meta ({x}, {y}) cm | {c.potencial} + {c.repulsivo} | escape: {c.escape}")
-    print("Origen fuera de la base. Rumbo inicial SDK: 90 grados, +Y hacia delante.")
-    print("Calibracion y ganancias iniciales: comprobar en laboratorio. No hay sensores traseros.")
-    input("Intro para conectar; Ctrl+C cancela: ")
-    return c, calibrador
-
-
-# PERCEPCION: MUESTRAS DEL EQUIPO DE T03/SESION 04, NO UNA CALIBRACION UNIVERSAL.
 MUESTRAS_IR = {
     5: [1377, 1350, 902.7, 1517, 1111, 1031.5, 1103],
     7.5: [512, 674, 415, 680, 460.2, 363, 461.1],
@@ -256,8 +406,8 @@ MUESTRAS_IR = {
 class CalibradorIR:
     def __init__(self, muestras):
         self.muestras = dict(sorted(muestras.items()))
-        if not self.muestras or min(self.muestras) != 5 or max(self.muestras) != 25:
-            raise ValueError("Se requieren muestras desde 5 hasta 25 cm")
+        if len(self.muestras) < 2:
+            raise ValueError("Se requieren al menos dos distancias calibradas")
         if any(not math.isfinite(d) or d <= 0 for d in self.muestras):
             raise ValueError("Distancias de calibracion invalidas")
         for fila in self.muestras.values():
@@ -266,6 +416,12 @@ class CalibradorIR:
         self.tablas = [tuple((fila[i], d/100) for d, fila in self.muestras.items()) for i in range(7)]
         if any(any(a[0] <= b[0] for a, b in zip(t, t[1:])) for t in self.tablas):
             raise ValueError("La intensidad de cada sensor debe disminuir con la distancia")
+
+    def validar_configuracion(self, config):
+        minimo, maximo = min(self.muestras)/100, max(self.muestras)/100
+        if not minimo < config.seguridad < config.influencia <= maximo:
+            raise ValueError(f"La tabla exige {minimo*100:g} cm < seguridad < influencia <= {maximo*100:g} cm")
+        return self
 
     def convertir(self, valores):
         if len(valores) != 7 or any(v is None or not math.isfinite(v) or v < 0 for v in valores):
@@ -300,7 +456,6 @@ class FiltroIR:
         return self.anteriores
 
 
-# REPULSION: TODOS LOS VECTORES SE EXPRESAN EN EL MARCO LOCAL DEL ROBOT.
 def repulsion(distancias, config):
     """Khatib: U=k/2*(1/d-1/d0)^2; alternativa U=k/2*(1-d/d0)^2.
 
@@ -312,7 +467,7 @@ def repulsion(distancias, config):
     for distancia, angulo in zip(distancias, config.angulos_ir):
         if not math.isfinite(distancia) or distancia >= config.influencia:
             continue
-        d, d0, k = max(distancia, 0.005), config.influencia, config.krep
+        d, d0, k = max(distancia, 0.005), config.influencia, config.ganancia_repulsiva
         if config.repulsivo == "khatib":
             potencial += 0.5*k*(1/d-1/d0)**2
             magnitud = k*(1/d-1/d0)/d**2
@@ -325,9 +480,79 @@ def repulsion(distancias, config):
     return potencial, fx, fy
 
 
+
+# INTERFAZ ESPECIFICA DE P02
+def validar_angulos(angulos):
+    if len(angulos) != 7 or not all(math.isfinite(a) for a in angulos):
+        raise ValueError("Introduzca siete angulos finitos en el orden real del SDK")
+    if len(set(angulos)) != 7 or any(abs(a) > math.pi/2+1e-6 for a in angulos):
+        raise ValueError("Los siete angulos deben ser distintos y estar entre -90 y 90 grados")
+
+
+def pedir_angulos(actual=()):
+    print("Angulos LOCALES de los IR: 0 delante, negativos derecha, positivos izquierda.")
+    print("Introduzca los siete valores medidos en orden SDK, separados por espacios.")
+    if actual:
+        print("Intro conserva:", [math.degrees(a) for a in actual])
+    while True:
+        entrada = input("Angulos IR (grados): ").strip()
+        try:
+            valores = actual if not entrada and actual else tuple(
+                math.radians(float(v.replace(',', '.'))) for v in entrada.split())
+            validar_angulos(valores)
+            return valores
+        except ValueError as exc:
+            print(exc)
+
+
+def cargar_calibracion(config):
+    muestras = MUESTRAS_IR
+    if config.calibracion_json:
+        datos = json.loads(Path(config.calibracion_json).read_text(encoding="utf-8-sig"))
+        if not isinstance(datos, dict):
+            raise ValueError("El JSON debe contener {distancia_cm: [ir1,...,ir7]}")
+        muestras = {float(d): [float(v) for v in fila] for d, fila in datos.items()}
+    return CalibradorIR(muestras).validar_configuracion(config)
+
+
+def editar_repulsion(c):
+    print("1. Khatib: U=k/2*(1/d-1/d0)^2, crece con intensidad cerca del obstaculo.")
+    print("2. Polinomico: U=k/2*(1-d/d0)^2, alternativa de crecimiento limitado.")
+    print("Ambos actuan solo dentro de d0. Sus ganancias requieren ajustes diferentes.")
+    while True:
+        opcion = input(f"Funcion [actual: {c.repulsivo}; Intro conserva]: ").strip()
+        if opcion in ("", "1", "2"):
+            break
+        print("Seleccione 1 o 2.")
+    base = replace(c, repulsivo={"1": "khatib", "2": "polinomico"}.get(opcion, c.repulsivo))
+    return editar_parametros(base, (
+        ("ganancia_repulsiva", "Ganancia repulsiva k", 1),
+        ("influencia", "Distancia de influencia (cm; dentro del rango calibrado)", 100),
+        ("fuerza_max_sensor", "Limite de fuerza por sensor", 1)))
+
+
+def editar_sensores(c):
+    angulos = pedir_angulos(c.angulos_ir)
+    alpha = pedir_numero("Filtro alpha (0 < alpha <= 1; 1 sin suavizado)", c.filtro_alpha, True)
+    seguridad = pedir_numero("Distancia de parada (cm)", c.seguridad*100, True)/100
+    print("JSON: {distancia_cm: [ir1,...,ir7]}; muestras medias de cada sensor.")
+    ruta = input("Ruta JSON (Intro conserva; 'heredada' recupera la tabla de T03): ").strip().strip('"')
+    ruta = c.calibracion_json if not ruta else "" if ruta.lower() == "heredada" else ruta
+    try:
+        nuevo = replace(c, angulos_ir=angulos, filtro_alpha=alpha,
+                        seguridad=seguridad, calibracion_json=ruta).validar()
+        cargar_calibracion(nuevo)
+        return nuevo
+    except (ValueError, TypeError, OSError) as exc:
+        print(f"No se guardaron los cambios de sensores: {exc}")
+        return c
+
+
+# LECTURAS Y DECISION: SIN ACCESO AL SDK.
 @dataclass(frozen=True)
 class Lectura:
     pose: Pose
+    tiempo_pose: float  # Reloj monotono al recibir odometria, antes de solicitar IR.
     intensidades: tuple
     distancias: tuple
     filtradas: tuple
@@ -341,21 +566,24 @@ class Decision:
     u_rep: float
     f_atr: tuple
     f_rep: tuple
-    f_extra: tuple
     f_res: tuple
     comando: tuple
     evento: str = ""
 
 
-class SupervisorPasivo:
-    """P02 no oculta los minimos locales: sirve como referencia sin escape."""
-    escapes = 0
+def limite_por_percepcion(distancias, config, dt):
+    """Limite adicional por alcance IR y proximidad, independiente del filtro.
 
-    def corregir(self, pose, t, distancia, fuerza, repulsiva, distancias, config):
-        return fuerza, "NAVEGACION", ""
+    No suponer espacio infinito si no hay deteccion: limitar al radio util.
+    Reservar margen hasta seguridad y una latencia basada en el ultimo ciclo.
+    Es un modelo conservador que requiere validacion fisica, no una garantia.
+    """
+    disponible = max(0.0, min(config.influencia, *distancias)-config.seguridad)
+    bt = config.frenado*max(config.periodo, dt)
+    return math.sqrt(bt*bt+2*config.frenado*disponible)-bt
 
 
-def decidir(lectura, config, supervisor, t):
+def decidir(lectura, config, rampa, dt):
     pose = lectura.pose
     dx, dy = config.meta_x-pose.x, config.meta_y-pose.y
     distancia = math.hypot(dx, dy)
@@ -364,31 +592,32 @@ def decidir(lectura, config, supervisor, t):
     ur, rx, ry = repulsion(lectura.filtradas, config)
     rep = (rx, ry)
     res = (atr[0]+rx, atr[1]+ry)
-    # La seguridad usa medidas SIN filtrar: el filtro no puede retrasar la parada.
+    # El filtro no puede retrasar una parada por proximidad critica.
     if min(lectura.distancias) <= config.seguridad:
-        return Decision("EMERGENCIA", distancia, ua, ur, atr, rep, (0, 0), res,
+        rampa.actual = 0.0
+        return Decision("EMERGENCIA", distancia, ua, ur, atr, rep, res,
                         (0, 0, 0, 0), "Distancia IR critica")
     if distancia <= config.tolerancia:
+        rampa.actual = 0.0
         error = 0 if config.meta_theta is None else angulo_corto(config.meta_theta-pose.theta)
         estado = "LLEGADA" if abs(error) <= config.tolerancia_angular else "ORIENTACION_FINAL"
         w = 0 if estado == "LLEGADA" else max(-config.wmax, min(config.wmax, config.kw*error))
-        return Decision(estado, distancia, ua, ur, atr, rep, (0, 0), res, ruedas(0, w, config))
-    corregida, estado, evento = supervisor.corregir(pose, t, distancia, res, rep, lectura.filtradas, config)
-    extra = (corregida[0]-res[0], corregida[1]-res[1])
-    v, w = velocidades(*corregida, distancia, config)
-    return Decision(estado, distancia, ua, ur, atr, rep, extra, corregida, ruedas(v, w, config), evento)
+        return Decision(estado, distancia, ua, ur, atr, rep, res, ruedas(0, w, config))
+    # Misma ley de P01, ahora con F_atr + F_rep en el marco local.
+    v, w = velocidades(*res, distancia, config)
+    v = min(v, limite_por_percepcion(lectura.distancias, config, dt))
+    v = rampa.limitar(v, dt, config)
+    comando = ruedas(v, w, config)
+    rampa.actual = comando[2]
+    return Decision("NAVEGACION", distancia, ua, ur, atr, rep, res, comando)
 
 
-def crear_supervisor(config):
-    return SupervisorPasivo()
-
-
-# REGISTRO: MEDIDAS SIN FILTRAR, FILTRADAS Y FUERZAS POR SEPARADO.
 class Registro:
     CAMPOS = ("t_s", "Ts_s", "dt_s", "x_m", "y_m", "theta_rad", "distancia_meta_m",
               "U_atr", "U_rep", "F_atr_x", "F_atr_y", "F_rep_x", "F_rep_y",
-              "F_extra_x", "F_extra_y", "F_res_x", "F_res_y", "v_m_s", "w_rad_s",
-              "v_izq_m_s", "v_der_m_s", "estado", "evento", "retraso_s") + tuple(
+              "F_res_x", "F_res_y", "F_res_modulo", "F_res_angulo_rad",
+              "v_m_s", "w_rad_s", "v_izq_m_s", "v_der_m_s", "estado", "evento",
+              "retraso_s", "v_odom_m_s", "w_odom_rad_s") + tuple(
                   f"{prefijo}{i}" for prefijo in ("ir_", "d_m_", "d_filtrada_m_") for i in range(1, 8))
 
     def __init__(self, config, calibrador):
@@ -399,17 +628,29 @@ class Registro:
         self.archivo = (self.carpeta/"recorrido.csv").open("w", newline="", encoding="utf-8")
         self.csv = csv.DictWriter(self.archivo, fieldnames=self.CAMPOS)
         self.csv.writeheader()
-        self.minima, self.vmax, self.retrasos, self.colisiones = math.inf, 0.0, 0, 0
+        self.minima, self.vmax, self.ciclos_tarde = math.inf, 0.0, 0
+        self.plazos_omitidos = 0
+        self.muestra_anterior = None
+        self.vmax_odom = None
 
     def ciclo(self, t, dt, lectura, decision, retraso, config):
         d, p = decision, lectura.pose
         izq, der, v, w = d.comando
         self.minima = min(self.minima, *lectura.distancias)
         self.vmax = max(self.vmax, abs(v))
-        self.retrasos += int(dt > config.periodo*1.5)
+        self.ciclos_tarde += int(dt > config.periodo*1.05)
+        vo = wo = None
+        if self.muestra_anterior is not None:
+            t0, p0 = self.muestra_anterior
+            intervalo = lectura.tiempo_pose-t0
+            if intervalo > 0:
+                vo = math.hypot(p.x-p0.x, p.y-p0.y)/intervalo
+                wo = angulo_corto(p.theta-p0.theta)/intervalo
+                self.vmax_odom = max(self.vmax_odom or 0, vo)
+        self.muestra_anterior = (lectura.tiempo_pose, p)
         valores = (t, config.periodo, dt, p.x, p.y, p.theta, d.distancia, d.u_atr, d.u_rep,
-                   *d.f_atr, *d.f_rep, *d.f_extra, *d.f_res, v, w, izq, der,
-                   d.estado, d.evento, retraso, *lectura.intensidades,
+                   *d.f_atr, *d.f_rep, *d.f_res, math.hypot(*d.f_res), math.atan2(d.f_res[1], d.f_res[0]),
+                   v, w, izq, der, d.estado, d.evento, retraso, vo, wo, *lectura.intensidades,
                    *(v if math.isfinite(v) else "" for v in lectura.distancias),
                    *(v if math.isfinite(v) else "" for v in lectura.filtradas))
         self.csv.writerow(dict(zip(self.CAMPOS, valores)))
@@ -419,35 +660,36 @@ class Registro:
         self.csv.writerow({"t_s": t, "estado": "FIN", "evento": texto})
         self.archivo.flush()
 
-    def cerrar(self, resultado, tiempo, error, escapes, colision):
+    def cerrar(self, resultado, tiempo, error, colision):
         self.archivo.close()
-        datos = {"resultado": resultado, "exito": resultado == "meta_alcanzada", "tiempo_s": tiempo,
-                 "error_final_m": error, "escapes": escapes, "colision": colision,
+        datos = {"resultado": resultado, "exito": resultado == "meta_alcanzada" and not colision,
+                 "tiempo_s": tiempo, "error_final_m": error, "colision": colision,
                  "distancia_minima_ir_m": self.minima if math.isfinite(self.minima) else None,
-                 "vmax_ordenada_m_s": self.vmax, "ciclos_lentos": self.retrasos,
-                 "nota": "Distancia minima estimada por IR, no separacion geometrica de todo el chasis."}
+                 "vmax_ordenada_m_s": self.vmax, "vmax_estimada_odometria_m_s": self.vmax_odom,
+                 "ciclos_lentos": self.ciclos_tarde, "plazos_omitidos": self.plazos_omitidos,
+                 "nota": "Minima IR estimada, no separacion de todo el chasis. Velocidad odometrica estimada; ciclo lento dt > 1.05*Ts."}
         (self.carpeta/"resultado.json").write_text(json.dumps(datos, indent=2), encoding="utf-8")
 
 
 async def navegar(adaptador, config, calibrador):
     registro = Registro(config, calibrador)
-    supervisor = crear_supervisor(config)
+    rampa = RampaAvance()
     inicio = anterior = plazo = time.monotonic()
     resultado, error = "interrumpida", None
     print(f"Registro: {registro.carpeta}")
     try:
         while True:
             adaptador.comprobar_seguridad()
-            ahora = time.monotonic()
-            if ahora-inicio >= config.tiempo_max:
+            if time.monotonic()-inicio >= config.tiempo_max:
                 raise TimeoutError("Tiempo maximo de mision alcanzado")
             lectura = await adaptador.leer_entorno()
-            decision = decidir(lectura, config, supervisor, ahora-inicio)
+            ahora = time.monotonic()
+            if ahora-inicio >= config.tiempo_max:
+                raise TimeoutError("Tiempo maximo de mision alcanzado durante la lectura")
+            decision = decidir(lectura, config, rampa, ahora-anterior)
             error = decision.distancia
             await adaptador.aplicar(*decision.comando[:2])
             registro.ciclo(ahora-inicio, ahora-anterior, lectura, decision, max(0, ahora-plazo), config)
-            if decision.evento:
-                print(decision.estado, decision.evento)
             if decision.estado in ("LLEGADA", "EMERGENCIA"):
                 resultado = "meta_alcanzada" if decision.estado == "LLEGADA" else decision.evento
                 break
@@ -455,7 +697,9 @@ async def navegar(adaptador, config, calibrador):
             plazo += config.periodo
             actual = time.monotonic()
             if plazo < actual:
-                plazo += (math.floor((actual-plazo)/config.periodo)+1)*config.periodo
+                omitidos = math.floor((actual-plazo)/config.periodo)+1
+                registro.plazos_omitidos += omitidos
+                plazo += omitidos*config.periodo
             await asyncio.sleep(max(0, plazo-time.monotonic()))
     except BaseException as exc:
         resultado = f"{type(exc).__name__}: {exc}"
@@ -464,19 +708,22 @@ async def navegar(adaptador, config, calibrador):
         try:
             await adaptador.parar()
         finally:
+            if adaptador.colision:
+                resultado = "Parachoques activado; mision cancelada"
             try:
                 registro.evento(time.monotonic()-inicio, resultado)
             finally:
-                registro.cerrar(resultado, time.monotonic()-inicio, error, supervisor.escapes, adaptador.colision)
+                registro.cerrar(resultado, time.monotonic()-inicio, error, adaptador.colision)
     return resultado
 
 
-# ADAPTADOR: SOLO ESTA CLASE Y ejecutar() CONOCEN EL SDK.
+# ADAPTADOR: LAS UNIDADES DEL SDK SE CONVIERTEN SOLO EN ESTE LIMITE.
 class Adaptador:
     def __init__(self, robot, config, calibrador):
         self.robot, self.config, self.calibrador = robot, config, calibrador
         self.filtro = FiltroIR(config.filtro_alpha)
         self.colision = False
+        self.origen_sdk = None
 
     def comprobar_seguridad(self):
         if self.colision:
@@ -484,18 +731,21 @@ class Adaptador:
 
     async def leer_entorno(self):
         self.comprobar_seguridad()
-        # Consultas secuenciales: no se presupone que el SDK serialice peticiones concurrentes.
         p = await asyncio.wait_for(self.robot.get_position(), self.config.timeout_lectura)
         if p is None or not all(math.isfinite(v) for v in (p.x, p.y, p.heading)):
             raise RuntimeError("Odometria no disponible")
-        pose = Pose(p.x/100, p.y/100, math.radians(p.heading))
+        tiempo_pose = time.monotonic()
+        pose_sdk = Pose(p.x/100, p.y/100, math.radians(p.heading))
+        if self.origen_sdk is None:
+            self.origen_sdk = pose_sdk  # Primera lectura parado despues del reinicio.
+        pose = pose_en_escenario(pose_sdk, self.origen_sdk, self.config.orientacion_inicial)
         ir = await asyncio.wait_for(self.robot.get_ir_proximity(), self.config.timeout_lectura)
-        if ir is None:
+        if ir is None or not hasattr(ir, "sensors"):
             raise RuntimeError("Sensores IR no disponibles")
         valores = tuple(ir.sensors)
         distancias = self.calibrador.convertir(valores)
         self.comprobar_seguridad()
-        return Lectura(pose, valores, distancias, self.filtro.actualizar(distancias))
+        return Lectura(pose, tiempo_pose, valores, distancias, self.filtro.actualizar(distancias))
 
     async def aplicar(self, izq, der):
         self.comprobar_seguridad()
@@ -512,6 +762,7 @@ def ejecutar(config, calibrador):
     from irobot_edu_sdk.backend.bluetooth import Bluetooth
     from irobot_edu_sdk.robots import Create3, event
     config.validar()
+    calibrador.validar_configuracion(config)
     robot = Create3(Bluetooth(config.robot))
     adaptador = Adaptador(robot, config, calibrador)
 
@@ -528,11 +779,14 @@ def ejecutar(config, calibrador):
             await asyncio.wait_for(r.reset_navigation(), config.timeout_lectura)
             await asyncio.sleep(0.2)
             await r.set_lights_on_rgb(0, 255, 0)
-            await adaptador.leer_entorno()
+            # Abrir registro antes de la primera lectura: registrar tambien fallos iniciales.
             await r.set_lights_on_rgb(0, 0, 255)
             resultado = await navegar(adaptador, config, calibrador)
             print(resultado)
-            await r.set_lights_on_rgb(*( (255, 80, 0) if resultado == "meta_alcanzada" else (255, 0, 0)))
+            if resultado == "meta_alcanzada":
+                await r.set_lights_on_rgb(255, 80, 0)
+            else:
+                await r.set_lights_blink_rgb(255, 0, 0)
         except Exception as exc:
             print(f"Mision detenida: {exc}")
         finally:
@@ -552,3 +806,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# VALIDACION FISICA P02 (guion 4.2): no sustituir por datos inventados.
+# Comprobar orden/angulos IR, ruido en reposo, intensidades medias y alcance util.
+# Escenario                 | Funcion | k_rep/k_atr | Colision | d_min | Tiempo | Observaciones
+# A. Un obstaculo           |         |             |          |       |        |
+# B. Dos o mas obstaculos   |         |             |          |       |        |
+# C. Paso estrecho          |         |             |          |       |        |
+# D. Repulsion alternativa  |         |             |          |       |        |
+# Ajustar ganancias segun sus unidades. Conservar CSV, configuracion y calibracion.
+# P02 no incorpora recuperacion de minimos locales: corresponde a P03.
