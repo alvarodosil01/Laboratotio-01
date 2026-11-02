@@ -10,12 +10,15 @@ from datetime import datetime
 from pathlib import Path
 
 
-# Geometria nominal Create 3, en orden derecha -> izquierda del guion/SDK.
+# Geometria nominal Create 3, en orden IZQUIERDA -> DERECHA del SDK
+# (side_left, left, front_left, front_center, front_right, right, side_right).
 # Fuente: iRobotEducation/create3_sim, create3.urdf.xacro (rama jazzy).
 # https://github.com/iRobotEducation/create3_sim/blob/jazzy/irobot_create_common/irobot_create_description/urdf/create3.urdf.xacro
-# Radianes LOCALES respecto al frontal. No son orientaciones globales.
-# Confirmar el orden de los indices al verificar fisicamente los sensores.
-ANGULOS_IR = (-1.309, -0.873, -0.436, 0.0, 0.436, 0.873, 1.309)
+# Radianes LOCALES respecto al frontal (+ = izquierda). No son orientaciones globales.
+# Orden comprobado en el registro 20261102_181647: al girar a la derecha el
+# obstaculo paso del indice 5 al 0, luego el indice 0 es el de la izquierda.
+# Con el orden invertido la repulsion lateral empujaba HACIA el obstaculo.
+ANGULOS_IR = (1.309, 0.873, 0.436, 0.0, -0.436, -0.873, -1.309)
 
 
 @dataclass(frozen=True)
@@ -30,7 +33,9 @@ class Configuracion:
     transicion: float = 0.30
     kv: float = 2.0
     kw: float = 1.5
-    vmax: float = 0.15  # 15 cm/s para ajustar la esquiva; limite SDK 50 cm/s.
+    # Ciclo real ~0.4 s y obstaculos visibles a ~15 cm: a 15 cm/s el robot
+    # recorria casi todo ese alcance antes de reaccionar. Limite SDK 50 cm/s.
+    vmax: float = 0.10
     wmax: float = 0.8
     rueda_max: float = 0.50
     aceleracion: float = 0.10  # m/s2: aumento progresivo desde reposo.
@@ -43,12 +48,21 @@ class Configuracion:
     timeout_lectura: float = 2.0
     # Repulsion ACTIVA: campos de la etapa P02.
     repulsivo: str = "khatib"
-    ganancia_repulsiva: float = 0.004
+    ganancia_repulsiva: float = 0.03  # 0.004 no superaba la atraccion: choque frontal.
     influencia: float = 0.25
+    # Componente tangencial: rodear el obstaculo; 0 desactiva (repulsion pura).
+    ganancia_tangencial: float = 1.0
+    liberar_esquiva: float = 1.0  # s sin deteccion para olvidar el lado de rodeo.
+    memoria_obstaculo: float = 10.0  # s que se recuerda cada punto IR fuera de la vista.
 
     angulos_ir: tuple = ANGULOS_IR  # Geometria fija al chasis; no se pide por teclado.
-    filtro_alpha: float = 0.5
-    confirmaciones_ir: int = 2  # Lecturas consecutivas por sensor para activar repulsion.
+    # Con ciclos reales de ~0.4 s y alcance IR de ~15 cm, cada ciclo de retraso
+    # (filtro o confirmacion) supone ~5 cm mas cerca: por defecto, sin retraso.
+    filtro_alpha: float = 1.0
+    confirmaciones_ir: int = 1  # Lecturas consecutivas por sensor para activar repulsion.
+    distancia_giro: float = 0.20  # IR frontal por debajo: girar en el sitio.
+    v_cerca: float = 0.05  # Avance maximo con un obstaculo a la vista.
+    presencia_ir: float = 0.70  # Fraccion del umbral IR frontal que ya frena.
     histeresis_ir: float = 0.10  # Desactivar al caer por debajo del 90% del umbral.
     seguridad: float = 0.06
     fuerza_max_sensor: float = 2.0
@@ -61,9 +75,12 @@ class Configuracion:
         for nombre in ("ganancia", "transicion", "kv", "kw", "vmax", "wmax",
                        "rueda_max", "separacion_ruedas", "tolerancia",
                        "tolerancia_angular", "periodo", "tiempo_max", "timeout_lectura",
-                       "ganancia_repulsiva", "influencia", "aceleracion", "frenado", "seguridad", "fuerza_max_sensor"):
+                       "ganancia_repulsiva", "influencia", "aceleracion", "frenado", "seguridad", "fuerza_max_sensor",
+                       "liberar_esquiva", "memoria_obstaculo"):
             if getattr(self, nombre) <= 0:
                 raise ValueError(f"{nombre}: debe ser mayor que cero")
+        if self.ganancia_tangencial < 0:
+            raise ValueError("ganancia_tangencial: no puede ser negativa")
         if self.potencial not in ("cuadratico", "conico", "hibrido", "suave"):
             raise ValueError("Potencial desconocido")
         if not self.robot.strip():
@@ -81,6 +98,10 @@ class Configuracion:
             raise ValueError("La histeresis IR debe estar entre 0 y 1 (excluido)")
         if self.seguridad >= self.influencia:
             raise ValueError("La distancia de seguridad debe ser menor que la influencia")
+        if not self.seguridad < self.distancia_giro <= self.influencia:
+            raise ValueError("Se requiere seguridad < distancia de giro <= influencia")
+        if self.v_cerca <= 0 or not 0 < self.presencia_ir <= 1:
+            raise ValueError("v_cerca debe ser positiva y 0 < presencia_ir <= 1")
         return self
 
 
@@ -129,7 +150,10 @@ def mostrar_configuracion(c):
     print(f"   Tiempo limite de comunicaciones={c.timeout_lectura:g} s")
     print(f"6. Repulsion: {c.repulsivo}; ganancia={c.ganancia_repulsiva:g}; influencia={c.influencia*100:g} cm")
     print(f"   Fuerza maxima por sensor={c.fuerza_max_sensor:g}")
+    print(f"   Rodeo tangencial={c.ganancia_tangencial:g}; liberar lado tras {c.liberar_esquiva:g} s sin deteccion")
+    print(f"   Memoria de obstaculos fuera de la vista={c.memoria_obstaculo:g} s")
     print(f"7. Sensores: alpha={c.filtro_alpha:g}; seguridad={c.seguridad*100:g} cm")
+    print(f"   Giro en el sitio si IR frontal < {c.distancia_giro*100:g} cm; avance con obstaculo <= {c.v_cerca*100:g} cm/s")
     print("   Geometria IR fija al robot; acompana automaticamente su orientacion.")
     print(f"   Deteccion: {c.confirmaciones_ir} lecturas consecutivas; histeresis={c.histeresis_ir*100:g}%")
     print("   Calibracion:", c.calibracion_json or "tabla heredada de sesion 04/T03")
@@ -248,7 +272,7 @@ def configurar():
     p.add_argument("--transicion-cm", type=float, default=30.0)
     p.add_argument("--kv", type=float, default=2.0)
     p.add_argument("--kw", type=float, default=1.5)
-    p.add_argument("--vmax-cm-s", type=float, default=15.0)
+    p.add_argument("--vmax-cm-s", type=float, default=10.0)
     p.add_argument("--wmax-grados-s", type=float, default=math.degrees(0.8))
     p.add_argument("--rueda-max-cm-s", type=float, default=50.0)
     p.add_argument("--aceleracion-cm-s2", type=float, default=10.0)
@@ -260,11 +284,17 @@ def configurar():
     p.add_argument("--tolerancia-angular-grados", type=float, default=3.0)
     p.add_argument("--timeout-lectura", type=float, default=2.0)
     p.add_argument("--repulsivo", choices=["khatib", "polinomico"], default="khatib", help="Funcion repulsiva activa")
-    p.add_argument("--ganancia-repulsiva", "--krep", type=float, default=0.004)
+    p.add_argument("--ganancia-repulsiva", "--krep", type=float, default=0.03)
     p.add_argument("--influencia-cm", type=float, default=25)
+    p.add_argument("--ganancia-tangencial", "--ktan", type=float, default=1.0,
+                   help="Rodeo del obstaculo; 0 = repulsion pura")
+    p.add_argument("--liberar-esquiva", type=float, default=1.0)
+    p.add_argument("--memoria-s", type=float, default=10.0, help="Segundos que se recuerda un obstaculo")
     p.add_argument("--sin-menu", action="store_true", help="Usar argumentos y confirmacion breve")
-    p.add_argument("--alpha", type=float, default=0.5)
+    p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--seguridad-cm", type=float, default=6)
+    p.add_argument("--giro-cm", type=float, default=20, help="IR frontal que provoca giro en el sitio")
+    p.add_argument("--v-cerca-cm-s", type=float, default=5, help="Avance maximo con obstaculo a la vista")
     p.add_argument("--fuerza-max-sensor", type=float, default=2)
     p.add_argument("--calibracion-json", default="", help="Tabla {distancia_cm: [ir1,...,ir7]}")
     a = p.parse_args()
@@ -284,7 +314,10 @@ def configurar():
             tolerancia_angular=math.radians(a.tolerancia_angular_grados),
             timeout_lectura=a.timeout_lectura, repulsivo=a.repulsivo,
             ganancia_repulsiva=a.ganancia_repulsiva, influencia=a.influencia_cm/100,
+            ganancia_tangencial=a.ganancia_tangencial, liberar_esquiva=a.liberar_esquiva,
+            memoria_obstaculo=a.memoria_s,
             filtro_alpha=a.alpha, seguridad=a.seguridad_cm/100,
+            distancia_giro=a.giro_cm/100, v_cerca=a.v_cerca_cm_s/100,
             fuerza_max_sensor=a.fuerza_max_sensor, calibracion_json=a.calibracion_json).validar()
     except (ValueError, EOFError) as error:
         p.error(str(error))
@@ -502,15 +535,16 @@ class FiltroIR:
         return self.anteriores
 
 
-def repulsion(distancias, config):
+def repulsion(distancias, config, angulos=None):
     """Khatib: U=k/2*(1/d-1/d0)^2; alternativa U=k/2*(1-d/d0)^2.
 
     Ambas son cero fuera de d0. Fuerza = -grad(U), hacia fuera del obstaculo.
     La magnitud de cada fuerza se limita como regularizacion del controlador.
     Sus ganancias tienen distintas unidades: ajustar por separado.
+    Sin angulos se usan los de los IR; con ellos, los de la memoria.
     """
     fx = fy = potencial = 0.0
-    for distancia, angulo in zip(distancias, config.angulos_ir):
+    for distancia, angulo in zip(distancias, config.angulos_ir if angulos is None else angulos):
         if not math.isfinite(distancia) or distancia >= config.influencia:
             continue
         d, d0, k = max(distancia, 0.005), config.influencia, config.ganancia_repulsiva
@@ -525,6 +559,91 @@ def repulsion(distancias, config):
         fy -= magnitud*math.sin(angulo)
     return potencial, fx, fy
 
+
+RADIO_IR = 0.154  # m del centro a los emisores IR (URDF): origen de cada distancia.
+CELDA_MEMORIA = 0.03  # m: puntos mas proximos se funden en uno.
+SECTOR_MEMORIA = math.radians(30)  # Un sensor virtual por sector alrededor del robot.
+
+
+class MemoriaObstaculos:
+    """Puntos IR detectados, guardados en los ejes FIJOS con la odometria.
+
+    Los IR solo cubren +-75 grados: al rodear un obstaculo este queda en la
+    zona ciega, la repulsion desaparece y la atraccion devuelve el robot
+    contra el (vaiven registrado en 20261102_182733). Recordar los puntos
+    mantiene la repulsion en los 360 grados. Se devuelve el punto mas cercano
+    de cada sector, como sensores virtuales, para que los muchos puntos de un
+    mismo obstaculo no sumen fuerzas sin limite. Un LIDAR podria alimentarla igual.
+    """
+    def __init__(self):
+        self.puntos = {}  # celda -> (x, y, t)
+
+    def actualizar(self, pose, distancias, t, config):
+        for d, a in zip(distancias, config.angulos_ir):
+            if math.isfinite(d):
+                r, g = RADIO_IR+d, pose.theta+a
+                x, y = pose.x+r*math.cos(g), pose.y+r*math.sin(g)
+                self.puntos[(round(x/CELDA_MEMORIA), round(y/CELDA_MEMORIA))] = (x, y, t)
+        self.puntos = {c: p for c, p in self.puntos.items() if t-p[2] <= config.memoria_obstaculo}
+
+    def virtuales(self, pose):
+        """Listas (distancias, angulos locales) del punto mas cercano por sector."""
+        sectores = {}
+        for x, y, _ in self.puntos.values():
+            dx, dy = x-pose.x, y-pose.y
+            d = math.hypot(dx, dy)-RADIO_IR
+            angulo = angulo_corto(math.atan2(dy, dx)-pose.theta)
+            s = round(angulo/SECTOR_MEMORIA)
+            if d < sectores.get(s, (math.inf, 0))[0]:
+                sectores[s] = (d, angulo)
+        return [d for d, _ in sectores.values()], [a for _, a in sectores.values()]
+
+
+def elegir_lado(rep, atr):
+    """+1 rodea por la izquierda y -1 por la derecha (marco local).
+
+    Primero el lado libre (la repulsion empuja hacia el); si el obstaculo
+    esta centrado, el lado de la meta; si tambien lo esta, la izquierda.
+    """
+    if abs(rep[1]) > 0.2*math.hypot(*rep):
+        return 1 if rep[1] > 0 else -1
+    if abs(atr[1]) > 1e-3:
+        return 1 if atr[1] > 0 else -1
+    return 1
+
+
+class MemoriaEsquiva:
+    """Lado de rodeo elegido al detectar el obstaculo y mantenido hasta dejarlo atras.
+
+    Frente a un obstaculo centrado la repulsion se opone a la atraccion sin
+    componente lateral: el robot solo frena y choca. Fijar el lado evita
+    ademas dudar entre izquierda y derecha mientras lo rodea.
+    """
+    def __init__(self):
+        self.lado, self.libre = 0, 0.0
+        self.girando = False  # Giro en el sitio por proximidad, con histeresis.
+        self.memoria = MemoriaObstaculos()
+
+    def actualizar(self, rep, atr, dt, config):
+        if rep != (0.0, 0.0):
+            self.libre = 0.0
+            if self.lado == 0:
+                self.lado = elegir_lado(rep, atr)
+        elif self.lado:
+            self.libre += dt
+            if self.libre >= config.liberar_esquiva:
+                self.lado, self.libre = 0, 0.0
+        return self.lado
+
+
+def tangencial(rep, lado, config):
+    """F_rep girada 90 grados hacia el lado de rodeo: bordear el obstaculo.
+
+    Proporcional a la repulsion, luego nula sin deteccion: al dejar el
+    obstaculo atras solo queda la atraccion y el robot se reorienta a la meta.
+    """
+    k = lado*config.ganancia_tangencial
+    return k*rep[1], -k*rep[0]
 
 
 # INTERFAZ ESPECIFICA DE P02
@@ -557,21 +676,31 @@ def editar_repulsion(c):
             break
         print("Seleccione 1 o 2.")
     base = replace(c, repulsivo={"1": "khatib", "2": "polinomico"}.get(opcion, c.repulsivo))
-    return editar_parametros(base, (
+    c = editar_parametros(base, (
         ("ganancia_repulsiva", "Ganancia repulsiva k", 1),
         ("influencia", "Distancia de influencia (cm; dentro del rango calibrado)", 100),
-        ("fuerza_max_sensor", "Limite de fuerza por sensor", 1)))
+        ("fuerza_max_sensor", "Limite de fuerza por sensor", 1),
+        ("liberar_esquiva", "Tiempo sin deteccion para volver a la meta (s)", 1),
+        ("memoria_obstaculo", "Tiempo que se recuerda un obstaculo fuera de la vista (s)", 1)))
+    while True:
+        try:
+            ktan = pedir_numero("Ganancia tangencial de rodeo (0 = repulsion pura)", c.ganancia_tangencial)
+            return replace(c, ganancia_tangencial=ktan).validar()
+        except ValueError as exc:
+            print(exc)
 
 
 def editar_sensores(c):
     alpha = pedir_numero("Filtro alpha (0 < alpha <= 1; 1 sin suavizado)", c.filtro_alpha, True)
     seguridad = pedir_numero("Distancia de parada (cm)", c.seguridad*100, True)/100
+    giro = pedir_numero("IR frontal que provoca giro en el sitio (cm)", c.distancia_giro*100, True)/100
+    v_cerca = pedir_numero("Avance maximo con obstaculo a la vista (cm/s)", c.v_cerca*100, True)/100
     print("JSON: {distancia_cm: [ir1,...,ir7]}; muestras medias de cada sensor.")
     ruta = input("Ruta JSON (Intro conserva; 'heredada' recupera la tabla de T03): ").strip().strip('"')
     ruta = c.calibracion_json if not ruta else "" if ruta.lower() == "heredada" else ruta
     try:
-        nuevo = replace(c, filtro_alpha=alpha,
-                        seguridad=seguridad, calibracion_json=ruta).validar()
+        nuevo = replace(c, filtro_alpha=alpha, seguridad=seguridad, distancia_giro=giro,
+                        v_cerca=v_cerca, calibracion_json=ruta).validar()
         cargar_calibracion(nuevo)
         return nuevo
     except (ValueError, TypeError, OSError) as exc:
@@ -583,11 +712,12 @@ def editar_sensores(c):
 @dataclass(frozen=True)
 class Lectura:
     pose: Pose
-    tiempo_pose: float  # Reloj monotono al recibir odometria, antes de solicitar IR.
+    tiempo_pose: float  # Reloj monotono al recibir odometria e IR (lectura simultanea).
     intensidades: tuple
     distancias: tuple
     filtradas: tuple
     detecciones: tuple = (False,)*7
+    presencia: tuple = (False,)*7  # Intensidad >= presencia_ir*umbral: algo se acerca.
 
 
 @dataclass(frozen=True)
@@ -601,6 +731,8 @@ class Decision:
     f_res: tuple
     comando: tuple
     evento: str = ""
+    f_tan: tuple = (0.0, 0.0)
+    lado: int = 0
 
 
 def limite_por_percepcion(distancias, config, dt):
@@ -615,33 +747,62 @@ def limite_por_percepcion(distancias, config, dt):
     return math.sqrt(bt*bt+2*config.frenado*disponible)-bt
 
 
-def decidir(lectura, config, rampa, dt):
+MARGEN_GIRO = 0.03  # m de histeresis para dejar de girar y volver a avanzar.
+ANGULO_FRONTAL = 0.5  # rad: sensores que miran al frente (0 y +-25 grados).
+
+
+def decidir(lectura, config, rampa, esquiva, dt):
     pose = lectura.pose
     dx, dy = config.meta_x-pose.x, config.meta_y-pose.y
     distancia = math.hypot(dx, dy)
     ua, fx, fy = atractivo(dx, dy, config)
     atr = a_local(fx, fy, pose.theta)
-    ur, rx, ry = repulsion(lectura.filtradas, config)
+    # Repulsion desde la memoria (incluye lo que se ve ahora): no se anula
+    # cuando el obstaculo pasa a la zona ciega lateral o trasera.
+    esquiva.memoria.actualizar(pose, lectura.filtradas, lectura.tiempo_pose, config)
+    distancias_mem, angulos_mem = esquiva.memoria.virtuales(pose)
+    ur, rx, ry = repulsion(distancias_mem, config, angulos_mem)
     rep = (rx, ry)
-    res = (atr[0]+rx, atr[1]+ry)
-    # El filtro no puede retrasar una parada por proximidad critica.
-    if min(lectura.distancias) <= config.seguridad:
+    lado = esquiva.actualizar(rep, atr, dt, config)
+    tan = tangencial(rep, lado, config)
+    res = (atr[0]+rx+tan[0], atr[1]+ry+tan[1])
+    # Obstaculo delante o demasiado cerca: no abortar, no quedarse parado y no
+    # confiar solo en el equilibrio de fuerzas (frente a un obstaculo centrado
+    # la repulsion apenas gira). El chasis es circular: girar en el sitio no
+    # acerca el contorno al obstaculo. Distancias sin filtrar: sin retraso.
+    frontales = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_FRONTAL]
+    frontal = min(lectura.distancias[i] for i in frontales)
+    cercania = min(lectura.distancias)
+    if cercania <= config.seguridad or frontal <= config.distancia_giro:
+        esquiva.girando = True
+    elif cercania > config.seguridad+MARGEN_GIRO and frontal > config.distancia_giro+MARGEN_GIRO:
+        esquiva.girando = False
+    if esquiva.girando and distancia > config.tolerancia:
+        if not esquiva.lado:
+            esquiva.lado = elegir_lado(repulsion(lectura.distancias, config)[1:], atr)
+        esquiva.libre = 0.0
         rampa.actual = 0.0
-        return Decision("EMERGENCIA", distancia, ua, ur, atr, rep, res,
-                        (0, 0, 0, 0), "Distancia IR critica")
+        return Decision("GIRO_OBSTACULO", distancia, ua, ur, atr, rep, res,
+                        ruedas(0, esquiva.lado*config.wmax, config),
+                        "Obstaculo delante: giro en el sitio", tan, esquiva.lado)
     if distancia <= config.tolerancia:
         rampa.actual = 0.0
         error = 0 if config.meta_theta is None else angulo_corto(config.meta_theta-pose.theta)
         estado = "LLEGADA" if abs(error) <= config.tolerancia_angular else "ORIENTACION_FINAL"
         w = 0 if estado == "LLEGADA" else max(-config.wmax, min(config.wmax, config.kw*error))
-        return Decision(estado, distancia, ua, ur, atr, rep, res, ruedas(0, w, config))
-    # Misma ley de P01, ahora con F_atr + F_rep en el marco local.
+        return Decision(estado, distancia, ua, ur, atr, rep, res, ruedas(0, w, config), "", tan, lado)
+    # Misma ley de P01, ahora con F_atr + F_rep + F_tan en el marco local.
     v, w = velocidades(*res, distancia, config)
     v = min(v, limite_por_percepcion(lectura.distancias, config, dt))
+    # Con un obstaculo a la vista (incluso por debajo del umbral calibrado en
+    # los frontales) avanzar despacio: entre lectura y orden pasan ~2 ciclos.
+    if math.isfinite(cercania) or rep != (0.0, 0.0) or any(lectura.presencia[i] for i in frontales):
+        v = min(v, config.v_cerca)
     v = rampa.limitar(v, dt, config)
     comando = ruedas(v, w, config)
     rampa.actual = comando[2]
-    return Decision("NAVEGACION", distancia, ua, ur, atr, rep, res, comando)
+    estado = "ESQUIVA" if lado else "NAVEGACION"
+    return Decision(estado, distancia, ua, ur, atr, rep, res, comando, "", tan, lado)
 
 
 class Registro:
@@ -649,7 +810,7 @@ class Registro:
               "U_atr", "U_rep", "F_atr_x", "F_atr_y", "F_rep_x", "F_rep_y",
               "F_res_x", "F_res_y", "F_res_modulo", "F_res_angulo_rad",
               "v_m_s", "w_rad_s", "v_izq_m_s", "v_der_m_s", "estado", "evento",
-              "retraso_s", "v_odom_m_s", "w_odom_rad_s") + tuple(
+              "retraso_s", "v_odom_m_s", "w_odom_rad_s", "F_tan_x", "F_tan_y", "lado_esquiva") + tuple(
                   f"{prefijo}{i}" for prefijo in ("ir_", "d_m_", "d_filtrada_m_", "deteccion_") for i in range(1, 8))
 
     def __init__(self, config, calibrador):
@@ -682,7 +843,8 @@ class Registro:
         self.muestra_anterior = (lectura.tiempo_pose, p)
         valores = (t, config.periodo, dt, p.x, p.y, p.theta, d.distancia, d.u_atr, d.u_rep,
                    *d.f_atr, *d.f_rep, *d.f_res, math.hypot(*d.f_res), math.atan2(d.f_res[1], d.f_res[0]),
-                   v, w, izq, der, d.estado, d.evento, retraso, vo, wo, *lectura.intensidades,
+                   v, w, izq, der, d.estado, d.evento, retraso, vo, wo, *d.f_tan, d.lado,
+                   *lectura.intensidades,
                    *(v if math.isfinite(v) else "" for v in lectura.distancias),
                    *(v if math.isfinite(v) else "" for v in lectura.filtradas),
                    *(int(activa) for activa in lectura.detecciones))
@@ -707,6 +869,7 @@ class Registro:
 async def navegar(adaptador, config, calibrador):
     registro = Registro(config, calibrador)
     rampa = RampaAvance()
+    esquiva = MemoriaEsquiva()
     inicio = anterior = plazo = time.monotonic()
     resultado, error = "interrumpida", None
     print(f"Registro: {registro.carpeta}")
@@ -719,12 +882,12 @@ async def navegar(adaptador, config, calibrador):
             ahora = time.monotonic()
             if ahora-inicio >= config.tiempo_max:
                 raise TimeoutError("Tiempo maximo de mision alcanzado durante la lectura")
-            decision = decidir(lectura, config, rampa, ahora-anterior)
+            decision = decidir(lectura, config, rampa, esquiva, ahora-anterior)
             error = decision.distancia
             await adaptador.aplicar(*decision.comando[:2])
             registro.ciclo(ahora-inicio, ahora-anterior, lectura, decision, max(0, ahora-plazo), config)
-            if decision.estado in ("LLEGADA", "EMERGENCIA"):
-                resultado = "meta_alcanzada" if decision.estado == "LLEGADA" else decision.evento
+            if decision.estado == "LLEGADA":
+                resultado = "meta_alcanzada"
                 break
             anterior = ahora
             plazo += config.periodo
@@ -765,7 +928,11 @@ class Adaptador:
 
     async def leer_entorno(self):
         self.comprobar_seguridad()
-        p = await asyncio.wait_for(self.robot.get_position(), self.config.timeout_lectura)
+        # Peticiones simultaneas: el SDK empareja cada respuesta por su id.
+        # En serie el ciclo real era ~0.4 s, demasiado para reaccionar con IR de 25 cm.
+        p, ir = await asyncio.wait_for(
+            asyncio.gather(self.robot.get_position(), self.robot.get_ir_proximity()),
+            self.config.timeout_lectura)
         if p is None or not all(math.isfinite(v) for v in (p.x, p.y, p.heading)):
             raise RuntimeError("Odometria no disponible")
         tiempo_pose = time.monotonic()
@@ -773,7 +940,6 @@ class Adaptador:
         if self.origen_sdk is None:
             self.origen_sdk = pose_sdk  # Primera lectura parado despues del reinicio.
         pose = pose_en_escenario(pose_sdk, self.origen_sdk, self.config.orientacion_inicial)
-        ir = await asyncio.wait_for(self.robot.get_ir_proximity(), self.config.timeout_lectura)
         if ir is None or not hasattr(ir, "sensors"):
             raise RuntimeError("Sensores IR no disponibles")
         valores = tuple(ir.sensors)
@@ -782,8 +948,9 @@ class Adaptador:
         self.comprobar_seguridad()
         # Distancias originales conservadas para parada inmediata y limite de avance.
         # Solo la repulsion recibe detecciones confirmadas y filtradas.
+        presencia = tuple(v >= self.config.presencia_ir*u for v, u in zip(valores, self.detector.umbrales))
         return Lectura(pose, tiempo_pose, valores, distancias,
-                       self.filtro.actualizar(confirmadas), tuple(self.detector.activas))
+                       self.filtro.actualizar(confirmadas), tuple(self.detector.activas), presencia)
 
     async def aplicar(self, izq, der):
         self.comprobar_seguridad()
