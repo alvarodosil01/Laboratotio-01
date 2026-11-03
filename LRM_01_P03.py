@@ -19,37 +19,54 @@ Cadena del piloto (P01 + P02):
 
 Supervisor de minimos locales (Parte 03), maquina de estados:
 
-          +-------------+  sin progreso en la ventana  +-------------------+
-          | NAVEGACION  | ---------------------------> | ESCAPE_CONTORNO   |
-          | (piloto P02)| <--------------------------- | o ESCAPE_SUBMETA  |
-          +-------------+  salida o tiempo agotado     +-------------------+
+          +-------------+  sin progreso y rodeado de   +-------------------+
+          | NAVEGACION  |  paredes (minimo local)      | ESCAPE_CONTORNO   |
+          | (piloto P02)| ---------------------------> | o ESCAPE_SUBMETA  |
+          |             |                              |  -> CAMINO_MAPA   |
+          |             | <--------------------------- | (camino del mapa  |
+          +-------------+  meta cerca o tiempo agotado |  hasta la meta)   |
+                 |                                     +-------------------+
                  |                                       (max. max_escapes)
                  v d_f <= epsilon
           LLEGADA / ORIENTACION_FINAL
 
     Detector: en una ventana de ventana_minimo segundos la distancia a la meta
-    no mejora progreso_minimo (parada, oscilacion o giro en el sitio). No
+    no mejora progreso_minimo (parada, oscilacion o giro en el sitio) Y el
+    robot esta rodeado de paredes (dentro de la envolvente convexa del mapa a
+    RADIO_CONCAVIDAD): rodeando un objeto suelto tambien se pierde progreso,
+    pero no se esta dentro de un obstaculo convexo. Separa las 29 detecciones
+    de las pruebas reales: todas las de la U si, todas las falsas no. No
     exige F_res = 0 exacto: con ruido y ciclos de ~0.35 s el robot oscila
     alrededor del minimo en vez de pararse en el.
-    Estrategia 1, seguimiento de contorno (tipo Bug2): bordear el obstaculo a
-        distancia_pared con la pared a un lado, hasta estar margen_salida mas
-        cerca de la meta que al detectar el minimo y con el rumbo a la meta libre.
-        Al bordear: v <= v_cerca, giro <= WMAX_CONTORNO, rumbo filtrado hacia la
-        pared y giro en el sitio solo a GIRO_CONTORNO (curvas en vez de trompos).
-    Estrategia 2, submeta virtual: meta temporal a distancia_submeta, girada
-        135 grados respecto a la meta (hacia atras y a un lado: fuera de la U);
-        al alcanzarla se vuelve a la meta real.
+    Mapa temporal: rejilla de 5 cm con todo lo que ven los IR en la mision
+        (no olvida, a diferencia de la memoria de 10 s de la repulsion).
+    Estrategia 1, contorno con el mapa: A* sobre el mapa desde el robot a la
+        meta, a distancia_pared de las paredes conocidas; lo no recorrido
+        cuesta mas, asi que sale de la U por donde entro y la rodea por fuera
+        pegado a sus bordes. Se rehace cada REPLANIFICAR s si los IR ven
+        paredes nuevas, y se sigue HASTA LA META (el piloto P02 no usa el
+        mapa y volvia a meterse en la U). A v_cerca solo dentro de la U.
+    Estrategia 2, submetas: sale de la U deshaciendo su propio rastro hasta
+        RETROCESO m y va a una submeta a 90 grados de la meta, a un lado, lo
+        justo para librar la U (al menos distancia_submeta); de ahi a la meta
+        por el camino del mapa (estado CAMINO_MAPA, igual que el contorno). El
+        lado es por donde la U del mapa sobresale menos.
     Un intento fallido (tiempo_max_escape) cambia de lado en el siguiente.
     "ninguna" desactiva la recuperacion: sirve de evidencia del problema (Paso 2).
 
+Luces: azul navegando; amarillo al detectar un minimo local hasta salir de la U;
+naranja al llegar; rojo parpadeante si falla o choca.
+
 Uso: python LRM_01_P03.py y menu (o --sin-menu con argumentos). Registro por
 ejecucion en datos/LRM_01_P03/<fecha>/: recorrido.csv, configuracion.json,
-calibracion.json y resultado.json (tiempo, error, escapes, distancia minima).
+calibracion.json, resultado.json (tiempo, error, escapes, distancia minima) y
+mapa.csv (celdas ocupadas del mapa temporal).
 """
 import argparse
 import asyncio
 import csv
 import json
+import heapq
 import math
 import time
 from collections import deque
@@ -116,15 +133,16 @@ class Configuracion:
     seguridad: float = 0.06
     fuerza_max_sensor: float = 2.0
     calibracion_json: str = ""  # Vacio: tabla heredada de sesion 04/T03.
-    # Parte 03: supervisor de minimos locales.
+    # Parte 03: supervisor de minimos locales. Solo la estrategia se elige en
+    # el menu; el resto son valores fijos, probados en el robot y en simulacion.
     estrategia_escape: str = "contorno"  # "ninguna", "contorno" o "submeta".
-    ventana_minimo: float = 8.0  # s sin progreso para declarar minimo local.
+    ventana_minimo: float = 6.0  # s sin progreso para declarar minimo local.
     progreso_minimo: float = 0.10  # m que debe mejorar la distancia en la ventana.
-    distancia_pared: float = 0.12  # m (IR) a mantener al seguir el contorno.
-    margen_salida: float = 0.10  # m mas cerca de la meta que al detectar (Bug2).
-    distancia_submeta: float = 1.0  # m de la submeta virtual al robot.
-    tiempo_max_escape: float = 45.0  # s por intento antes de cambiar de lado.
-    max_escapes: int = 6
+    distancia_pared: float = 0.12  # m (IR) a las paredes en el camino del mapa.
+    margen_salida: float = 0.05  # m mas cerca de la meta que al detectar (Bug2).
+    distancia_submeta: float = 0.6  # m minimos de la submeta lateral al punto de retroceso.
+    tiempo_max_escape: float = 90.0  # s por intento (salida, rodeo y, en contorno, hasta la meta).
+    max_escapes: int = 5
 
     def validar(self):
         for nombre, valor in asdict(self).items():
@@ -225,11 +243,7 @@ def mostrar_configuracion(c):
     print("   Geometria IR fija al robot; acompana automaticamente su orientacion.")
     print(f"   Deteccion: {c.confirmaciones_ir} lecturas consecutivas; histeresis={c.histeresis_ir*100:g}%")
     print("   Calibracion:", c.calibracion_json or "tabla heredada de sesion 04/T03")
-    print(f"8. Minimos locales: escape={c.estrategia_escape}; minimo si en {c.ventana_minimo:g} s "
-          f"la distancia a la meta mejora < {c.progreso_minimo*100:g} cm")
-    print(f"   Contorno: pared a {c.distancia_pared*100:g} cm; salir {c.margen_salida*100:g} cm mas cerca de la meta")
-    print(f"   Submeta virtual a {c.distancia_submeta*100:g} cm; "
-          f"{c.tiempo_max_escape:g} s por intento; maximo {c.max_escapes} escapes")
+    print(f"8. Estrategia ante minimos locales: {c.estrategia_escape}")
     print("I. Iniciar mision con estos valores | Q. Salir sin conectar")
     print("0. Corregir la orientacion inicial introducida")
 
@@ -338,28 +352,15 @@ def menu_configuracion(c):
 
 def editar_minimos(c):
     print("1. Ninguna: sin recuperacion (evidencia del minimo local, Paso 2).")
-    print("2. Contorno: bordear el obstaculo hasta acercarse a la meta con el camino libre.")
-    print("3. Submeta: ir a una meta virtual hacia atras y a un lado, y volver a la meta.")
+    print("2. Contorno: mapa temporal de lo visto y camino (A*) que rodea la U por sus bordes.")
+    print("3. Submeta: retroceder por el camino recorrido, ir a un lado y volver a la meta.")
     opciones = {"1": "ninguna", "2": "contorno", "3": "submeta"}
     while True:
         entrada = input(f"Estrategia 1-3 [actual: {c.estrategia_escape}; Intro conserva]: ").strip()
         if not entrada or entrada in opciones:
             break
         print("Elija una opcion del 1 al 3.")
-    c = replace(c, estrategia_escape=opciones.get(entrada, c.estrategia_escape))
-    c = editar_parametros(c, (
-        ("ventana_minimo", "Ventana del detector (s)", 1),
-        ("progreso_minimo", "Mejora minima de la distancia a la meta en la ventana (cm)", 100),
-        ("distancia_pared", "Distancia IR a la pared al seguir el contorno (cm)", 100),
-        ("margen_salida", "Salir del contorno estando esto mas cerca de la meta (cm)", 100),
-        ("distancia_submeta", "Distancia de la submeta virtual (cm)", 100),
-        ("tiempo_max_escape", "Tiempo maximo de cada intento de escape (s)", 1)))
-    while True:
-        try:
-            n = int(pedir_numero("Numero maximo de escapes", c.max_escapes, True))
-            return replace(c, max_escapes=n).validar()
-        except ValueError as exc:
-            print(exc)
+    return replace(c, estrategia_escape=opciones.get(entrada, c.estrategia_escape)).validar()
 
 
 def configurar():
@@ -400,13 +401,6 @@ def configurar():
     p.add_argument("--calibracion-json", default="", help="Tabla {distancia_cm: [ir1,...,ir7]}")
     p.add_argument("--escape", choices=ESTRATEGIAS, default="contorno",
                    help="Estrategia ante un minimo local; 'ninguna' = sin recuperacion")
-    p.add_argument("--ventana-s", type=float, default=8.0, help="Ventana del detector de minimos")
-    p.add_argument("--progreso-cm", type=float, default=10.0, help="Mejora minima en la ventana")
-    p.add_argument("--pared-cm", type=float, default=12.0, help="Distancia IR al seguir el contorno")
-    p.add_argument("--salida-cm", type=float, default=10.0, help="Margen de salida del contorno (Bug2)")
-    p.add_argument("--submeta-cm", type=float, default=100.0, help="Distancia de la submeta virtual")
-    p.add_argument("--tiempo-escape", type=float, default=45.0, help="Segundos por intento de escape")
-    p.add_argument("--max-escapes", type=int, default=6)
     a = p.parse_args()
     try:
         # Los argumentos precargan el menu; la conversion a SI se realiza aqui.
@@ -429,10 +423,7 @@ def configurar():
             filtro_alpha=a.alpha, seguridad=a.seguridad_cm/100,
             distancia_giro=a.giro_cm/100, v_cerca=a.v_cerca_cm_s/100,
             fuerza_max_sensor=a.fuerza_max_sensor, calibracion_json=a.calibracion_json,
-            estrategia_escape=a.escape, ventana_minimo=a.ventana_s,
-            progreso_minimo=a.progreso_cm/100, distancia_pared=a.pared_cm/100,
-            margen_salida=a.salida_cm/100, distancia_submeta=a.submeta_cm/100,
-            tiempo_max_escape=a.tiempo_escape, max_escapes=a.max_escapes).validar()
+            estrategia_escape=a.escape).validar()
     except (ValueError, EOFError) as error:
         p.error(str(error))
     if not a.sin_menu:
@@ -786,8 +777,6 @@ class MemoriaEsquiva:
     def __init__(self):
         self.lado, self.libre = 0, 0.0
         self.girando = False  # Giro en el sitio por proximidad, con histeresis.
-        self.rumbo = None  # Rumbo de contorno filtrado, en ejes fijos (P03).
-        self.busqueda = 0.0  # s seguidos sin pared al bordear.
         self.memoria = MemoriaObstaculos()
 
     def actualizar(self, rep, atr, dt, config):
@@ -844,45 +833,168 @@ def desvio(distancias, angulos, lado, config):
     return rumbo
 
 
-KP_PARED = 6.0  # rad por metro de error respecto a distancia_pared.
-CORRECCION_MAX = 0.8  # rad: acercarse o alejarse de la pared como mucho ~45 grados.
-SUAVIZADO_CONTORNO = 0.4  # Fraccion del cambio de rumbo aceptada por ciclo.
-WMAX_CONTORNO = 0.8  # rad/s: giro maximo al bordear (curvas, no trompos).
-GIRO_CONTORNO = 0.16  # m: frontal que obliga a girar en el sitio al bordear.
-BUSQUEDA_PARED = 0.6  # rad: sin pared, girar hacia su lado para recuperarla...
-TIEMPO_BUSQUEDA = 5.0  # s: ...y si no aparece, ir hacia la meta (Bug2).
-COS_DETRAS = -math.cos(math.radians(30))  # Puntos a menos de 30 grados de la espalda.
-SENO_FRONTAL = math.sin(math.radians(20))  # Del lado contrario, solo +-20 grados al frente.
-
-
-def rumbo_contorno(distancias, angulos, lado_pared, config):
-    """Rumbo local para bordear el obstaculo con la pared a la izquierda (+1)
-    o a la derecha (-1), a distancia_pared del punto mas cercano.
-
-    Tangente al punto mas cercano (a -/+ 90 grados) corregida por el error de
-    distancia. La memoria cubre 360 grados: en una esquina exterior el punto
-    mas cercano queda detras-al-lado y el rumbo gira alrededor de ella. Solo
-    cuentan los puntos del lado de la pared o de delante (rincones), y no los
-    de justo detras: en el fondo de una U de 60 cm el mas cercano saltaba al
-    otro brazo y el rumbo devolvia al robot al fondo (simulacion). Lo que
-    bloquea el avance cuenta siempre: si no, el rincon del fondo (delante y
-    al otro lado) se ignoraba hasta tenerlo encima.
-    None sin pared a la vista (ver decidir).
-    """
-    cerca = [(d, a) for d, a in zip(distancias, angulos)
-             if d < config.influencia and math.cos(a) > COS_DETRAS
-             and (lado_pared*math.sin(a) > -SENO_FRONTAL or bloquea(d, a))]
-    if not cerca:
-        return None
-    d, a = min(cerca)
-    correccion = max(-CORRECCION_MAX, min(CORRECCION_MAX, KP_PARED*(config.distancia_pared-d)))
-    return angulo_corto(a-lado_pared*(math.pi/2+correccion))
+WMAX_ESCAPE = 0.8  # rad/s: giro maximo en el escape (curvas, no trompos).
+GIRO_ESCAPE = 0.16  # m: frontal que obliga a girar en el sitio en el escape.
 
 
 def via_libre(distancias, angulos, rumbo, config):
     """Ningun punto bloquea el corredor del robot si avanza con ese rumbo local."""
     return not any(magnitud_repulsiva(d, config) is not None and bloquea(d, a-rumbo)
                    for d, a in zip(distancias, angulos))
+
+
+CELDA_MAPA = 0.05  # m: lado de la celda del mapa temporal.
+ZONA_MAPA = 0.15  # m mas alla de la holgura con coste: pasar algo mas lejos de las paredes.
+COSTE_ZONA = 3.0  # Coste extra maximo junto a la holgura.
+COSTE_DESCONOCIDO = 1.0  # Coste extra de lo no recorrido DENTRO de la U: salir por donde
+# se entro. Fuera de ella sin coste: con el, al salir seguia su rastro hacia atras, giraba
+# hacia un lado y luego cambiaba al otro (20261103_173601).
+ANCHO_RASTRO = 0.15  # m alrededor del centro que el chasis (radio 0.17) ha barrido: libre.
+MARGEN_MAPA = 1.0  # m alrededor de lo conocido donde se busca camino.
+MAX_EXPANSIONES = 60000
+VECINOS = tuple((dx, dy, math.hypot(dx, dy)) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy)
+
+
+class MapaTemporal:
+    """Mapa de ocupacion temporal: rejilla de CELDA_MAPA en ejes fijos con
+    TODO lo que detectan los IR durante la mision, y el rastro recorrido.
+
+    La memoria de la repulsion olvida a los 10 s; este mapa no: sabe donde
+    esta la U para rodearla. Al seguir el camino planificado los IR ven
+    paredes nuevas (la cara exterior de la U) y el camino se rehace.
+    """
+    def __init__(self):
+        self.ocupadas = set()
+        self.libres = set()  # Celdas barridas por el chasis: seguro que libres.
+        self.version = 0  # Cambia cuando aparece una celda ocupada nueva.
+
+    @staticmethod
+    def celda(x, y):
+        return round(x/CELDA_MAPA), round(y/CELDA_MAPA)
+
+    def actualizar(self, pose, distancias, angulos):
+        # Donde ha estado el chasis no hay obstaculo: esas celdas se borran y
+        # no se vuelven a marcar. Lecturas IR falsas sobre el camino de
+        # entrada cerraban la boca de la U en el mapa y el A* no encontraba
+        # salida (20261103_171100).
+        cx, cy = self.celda(pose.x, pose.y)
+        k = round(ANCHO_RASTRO/CELDA_MAPA)
+        barridas = {(cx+dx, cy+dy) for dx in range(-k, k+1) for dy in range(-k, k+1)
+                    if dx*dx+dy*dy <= k*k}
+        self.libres |= barridas
+        antes = set(self.ocupadas)
+        self.ocupadas -= barridas
+        for d, a in zip(distancias, angulos):
+            if math.isfinite(d):
+                r, g = RADIO_IR+d, pose.theta+a
+                celda = self.celda(pose.x+r*math.cos(g), pose.y+r*math.sin(g))
+                if celda not in self.libres:
+                    self.ocupadas.add(celda)
+        if self.ocupadas != antes:
+            self.version += 1
+
+    def camino(self, inicio, meta, holgura, zona_u=(), lado=None):
+        """A* (8 vecinos) de inicio a meta; puntos (x, y) en m, o None.
+
+        El robot es un punto: celdas a menos de holgura (radio + distancia a
+        la pared) de algo ocupado, prohibidas; hasta ZONA_MAPA mas, con coste
+        para no rozar. Lo desconocido se supone libre pero cuesta mas que el
+        rastro: sale de la U por donde entro y la rodea por fuera, pegado a
+        la holgura de sus paredes. Alrededor del inicio se permite pasar por
+        celdas prohibidas (el robot puede estar ya cerca de una pared).
+        """
+        k = math.ceil((holgura+ZONA_MAPA)/CELDA_MAPA)
+        coste = {}
+        for dx in range(-k, k+1):
+            for dy in range(-k, k+1):
+                d = math.hypot(dx, dy)*CELDA_MAPA
+                if d <= holgura+ZONA_MAPA:
+                    coste[(dx, dy)] = math.inf if d <= holgura else COSTE_ZONA*(1-(d-holgura)/ZONA_MAPA)
+        extra = {}
+        for cx, cy in self.ocupadas:
+            for (dx, dy), c in coste.items():
+                n = (cx+dx, cy+dy)
+                if c > extra.get(n, 0.0):
+                    extra[n] = c
+        s, g = self.celda(*inicio), self.celda(*meta)
+        if extra.get(g, 0.0) == math.inf:
+            return None
+        xs = [c[0] for c in self.ocupadas]+[s[0], g[0]]
+        ys = [c[1] for c in self.ocupadas]+[s[1], g[1]]
+        m = round(MARGEN_MAPA/CELDA_MAPA)
+        x0, x1, y0, y1 = min(xs)-m, max(xs)+m, min(ys)-m, max(ys)+m
+        cerca_inicio = (holgura/CELDA_MAPA)**2
+        abiertos, g_coste, padre, expandidas = [(0.0, s)], {s: 0.0}, {}, 0
+        while abiertos and expandidas < MAX_EXPANSIONES:
+            _, c = heapq.heappop(abiertos)
+            if c == g:
+                break
+            expandidas += 1
+            for dx, dy, paso in VECINOS:
+                n = (c[0]+dx, c[1]+dy)
+                if not (x0 <= n[0] <= x1 and y0 <= n[1] <= y1):
+                    continue
+                e = extra.get(n, 0.0)
+                if e == math.inf:
+                    if (n[0]-s[0])**2+(n[1]-s[1])**2 > cerca_inicio:
+                        continue
+                    e = 2*COSTE_ZONA
+                if n not in self.libres and dentro_de((n[0]*CELDA_MAPA, n[1]*CELDA_MAPA), zona_u):
+                    e += COSTE_DESCONOCIDO
+                if lado is not None and lado(n[0]*CELDA_MAPA, n[1]*CELDA_MAPA):
+                    e += COSTE_OTRO_LADO
+                nuevo = g_coste[c]+paso*(1+e)
+                if nuevo < g_coste.get(n, math.inf):
+                    g_coste[n], padre[n] = nuevo, c
+                    heapq.heappush(abiertos, (nuevo+math.hypot(n[0]-g[0], n[1]-g[1]), n))
+        if g not in padre:
+            return None
+        celdas = [g]
+        while celdas[-1] != s:
+            celdas.append(padre[celdas[-1]])
+        puntos, ultimo = [], inicio
+        for cx, cy in reversed(celdas[:-1]):
+            q = (cx*CELDA_MAPA, cy*CELDA_MAPA)
+            if math.hypot(q[0]-ultimo[0], q[1]-ultimo[1]) >= PASO_RUTA:
+                puntos.append(q)
+                ultimo = q
+        return puntos+[meta]
+
+    def dentro(self, punto, centro, radio=1.5):
+        """El punto esta dentro de la envolvente convexa de lo ocupado a menos
+        de radio del centro (el minimo local): dentro de la U."""
+        return dentro_de(punto, self.envolvente(centro, radio))
+
+    def envolvente(self, centro, radio):
+        """Envolvente convexa (lista de vertices) de lo ocupado a menos de radio
+        del centro; [] si hay menos de 3 puntos."""
+        pts = sorted({(cx*CELDA_MAPA, cy*CELDA_MAPA) for cx, cy in self.ocupadas
+                      if math.hypot(cx*CELDA_MAPA-centro[0], cy*CELDA_MAPA-centro[1]) <= radio})
+        if len(pts) < 3:
+            return []
+        abajo, arriba = [], []
+        for q in pts:
+            while len(abajo) >= 2 and giro(abajo[-2], abajo[-1], q) <= 0:
+                abajo.pop()
+            abajo.append(q)
+        for q in reversed(pts):
+            while len(arriba) >= 2 and giro(arriba[-2], arriba[-1], q) <= 0:
+                arriba.pop()
+            arriba.append(q)
+        envolvente = abajo[:-1]+arriba[:-1]
+        return envolvente if len(envolvente) >= 3 else []
+
+
+def giro(o, a, b):
+    """Producto vectorial (a-o)x(b-o): >0 si o->a->b gira a la izquierda."""
+    return (a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0])
+
+
+def dentro_de(punto, envolvente):
+    """El punto esta dentro del poligono convexo (vertices en sentido antihorario)."""
+    return len(envolvente) >= 3 and all(
+        giro(envolvente[i], envolvente[(i+1) % len(envolvente)], punto) >= 0
+        for i in range(len(envolvente)))
 
 
 # INTERFAZ ESPECIFICA DE P02
@@ -998,9 +1110,11 @@ RETRASO_MAX = 0.8  # s: un ciclo mas largo no se usa para predecir el giro.
 LIMITE_LATERAL = 2.0  # Empuje lateral maximo, en veces la atraccion (simulacion).
 
 
-def decidir(lectura, config, rampa, esquiva, dt, contorno=0):
-    """Piloto P02. contorno=+1/-1 (P03): seguir el obstaculo con la pared a la
-    izquierda/derecha en lugar de la direccion de F_res; seguridad sin cambios."""
+def decidir(lectura, config, rampa, esquiva, dt, directo=False, lento=None):
+    """Piloto P02. directo (P03): derecho a la meta (un punto de un camino ya
+    planificado o recorrido), con el giro de emergencia mas cerca. lento
+    (por defecto = directo): avance limitado a v_cerca."""
+    lento = directo if lento is None else lento
     pose = lectura.pose
     dx, dy = config.meta_x-pose.x, config.meta_y-pose.y
     distancia = math.hypot(dx, dy)
@@ -1020,9 +1134,6 @@ def decidir(lectura, config, rampa, esquiva, dt, contorno=0):
     # Rodeo solo frente a lo que bloquea la trayectoria: con la repulsion
     # total y la memoria el lado no se liberaba nunca y el robot orbitaba.
     lado = esquiva.actualizar((bx, by), atr, dt, config)
-    if contorno:
-        # Giro de emergencia siempre hacia el lado contrario a la pared.
-        lado = esquiva.lado = -contorno
     # Lo que bloquea no empuja: la atraccion, con su modulo, apunta al rumbo
     # que lo deja a un lado. Antes la repulsion (~5) y la atraccion (~0.3) se
     # peleaban y el robot rebotaba lejos del obstaculo antes de rodearlo.
@@ -1044,39 +1155,29 @@ def decidir(lectura, config, rampa, esquiva, dt, contorno=0):
         lateral = (lateral[0]*escala, lateral[1]*escala)
         tan = (tan[0]*escala, tan[1]*escala)
     res = (guia[0]+lateral[0], guia[1]+lateral[1])
-    if contorno:
-        # Rumbo en ejes fijos y filtrado: el punto mas cercano salta de sector
-        # y el rumbo con el; con ~2 ciclos de retraso cada salto era un giro a
-        # tope y el robot daba trompos en el fondo de la U (20261103_130653).
-        # Solo se filtra el giro HACIA la pared; apartarse de ella es inmediato
-        # (filtrado en ambos sentidos chocaba en el rincon del fondo).
-        # Sin pared: al rodear la punta de un brazo se pierde un momento y
-        # hay que girar hacia ella; ir a la meta ahi devolvia el robot a la U.
-        # Pero si no reaparece, girar sin fin dibujaba circulos de 30 cm en
-        # el vacio hasta agotar el escape: entonces, hacia la meta (Bug2).
-        local = rumbo_contorno(distancias_mem, angulos_mem, contorno, config)
-        esquiva.busqueda = 0.0 if local is not None else esquiva.busqueda+dt
-        if local is None:
-            local = (contorno*BUSQUEDA_PARED if esquiva.busqueda < TIEMPO_BUSQUEDA
-                     else math.atan2(atr[1], atr[0]))
-        objetivo = pose.theta+local
-        if esquiva.rumbo is not None and contorno*angulo_corto(objetivo-esquiva.rumbo) > 0:
-            objetivo = esquiva.rumbo+SUAVIZADO_CONTORNO*angulo_corto(objetivo-esquiva.rumbo)
-        esquiva.rumbo = objetivo
-        rumbo = angulo_corto(objetivo-pose.theta)
-        res = (math.cos(rumbo), math.sin(rumbo))
+    if directo:
+        # Camino del mapa o rastro ya recorrido: derecho al punto. Cerca de un
+        # punto la atraccion es debil y el empuje de lo recordado lo hacia
+        # orbitar 27 s sin alcanzarlo (20261103_163541). Seguridad intacta.
+        # Solo la direccion: el modulo de la atraccion a un punto a 20 cm es
+        # ~0.05 y la velocidad (kv*|F|) subia y bajaba en cada punto: iba a
+        # tirones entre 6 y 12 cm/s (20261103_172059).
+        modulo = math.hypot(*atr) or 1.0
+        res = (atr[0]/modulo, atr[1]/modulo)
     # Obstaculo delante o demasiado cerca: no abortar, no quedarse parado y no
     # confiar solo en el equilibrio de fuerzas (frente a un obstaculo centrado
     # la repulsion apenas gira). El chasis es circular: girar en el sitio no
     # acerca el contorno al obstaculo. Distancias sin filtrar: sin retraso.
     frontales = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_FRONTAL]
+    delante = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_DELANTE]
     frontal = min(distancias[i] for i in frontales)
-    cercania = min(distancias)
-    # Al bordear, rumbo_contorno ya se aparta de lo que hay delante: el giro en
-    # el sitio queda como emergencia, mas cerca y mas lento (a 12 cm chocaba
-    # en el rincon del fondo con 2 ciclos de retraso; 16 cm no).
-    giro = min(config.distancia_giro, GIRO_CONTORNO) if contorno else config.distancia_giro
-    wmax = WMAX_CONTORNO if contorno else config.wmax
+    # Siguiendo un camino se va cerca de las paredes: los IR laterales
+    # (+-75 grados) no cuentan, o el giro seguia hasta perder el camino
+    # (20261103_160033), y el giro en el sitio queda como emergencia, mas
+    # cerca y mas lento (a 12 cm chocaba en un rincon con 2 ciclos de retraso).
+    cercania = min(distancias[i] for i in delante) if directo else min(distancias)
+    giro = min(config.distancia_giro, GIRO_ESCAPE) if directo else config.distancia_giro
+    wmax = WMAX_ESCAPE if directo else config.wmax
     if cercania <= config.seguridad or frontal <= giro:
         esquiva.girando = True
     elif cercania > config.seguridad+MARGEN_GIRO and frontal > giro+MARGEN_GIRO:
@@ -1086,7 +1187,11 @@ def decidir(lectura, config, rampa, esquiva, dt, contorno=0):
             esquiva.lado = elegir_lado(repulsion(distancias, config)[1:3], atr)
         esquiva.libre = 0.0
         rampa.actual = 0.0
-        comando = ruedas(0, esquiva.lado*wmax, config)
+        # Siguiendo un camino, girar hacia el punto: girar hacia el lado de
+        # esquiva mientras el camino tiraba al contrario dejo al robot 15 s
+        # oscilando frente a la pared (20261103_165141).
+        sentido = (1 if atr[1] >= 0 else -1) if directo else esquiva.lado
+        comando = ruedas(0, sentido*wmax, config)
         rampa.giro = comando[3]
         return Decision("GIRO_OBSTACULO", distancia, ua, ur, atr, rep, res, comando,
                         "Obstaculo delante: giro en el sitio", tan, esquiva.lado)
@@ -1106,7 +1211,6 @@ def decidir(lectura, config, rampa, esquiva, dt, contorno=0):
     # Solo frenan los obstaculos en la trayectoria (+-50 grados): uno al costado
     # o recordado detras mientras se rodea no se acerca al avanzar. Antes
     # cualquier deteccion imponia v_cerca y el 77% del recorrido iba a 5 cm/s.
-    delante = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_DELANTE]
     v = min(v, limite_por_percepcion([distancias[i] for i in delante], config, dt))
     # Con un obstaculo delante avanzar despacio: entre lectura y orden pasan
     # ~2 ciclos. La presencia (intensidad por debajo del umbral calibrado)
@@ -1116,10 +1220,10 @@ def decidir(lectura, config, rampa, esquiva, dt, contorno=0):
     # La presencia esta mas alla del alcance calibrado: tampoco cuenta si ese
     # alcance ya queda detras de la meta.
     presencia = math.isfinite(antes_de_meta(config.influencia, distancia))
-    # Al bordear, siempre despacio: con el giro limitado a WMAX_CONTORNO el
-    # radio de curva es v/w; a 0.21 m/s abria la esquina del brazo de la U,
-    # perdia la pared y volvia contra ella (simulacion con 2 ciclos de retraso).
-    if contorno or any(math.isfinite(distancias[i]) for i in delante) or (presencia and any(
+    # En el escape, siempre despacio: con el giro limitado a WMAX_ESCAPE el
+    # radio de curva es v/w; a 0.21 m/s abria la esquina del brazo de la U
+    # (simulacion con 2 ciclos de retraso).
+    if lento or any(math.isfinite(distancias[i]) for i in delante) or (presencia and any(
             lectura.presencia[i] for i in frontales)):
         v = min(v, config.v_cerca)
     v = rampa.limitar(v, dt, config)
@@ -1158,11 +1262,12 @@ TOLERANCIA_SUBMETA = 0.15  # m: la submeta solo orienta, no exige precision.
 
 
 class Supervisor:
-    """Maquina de estados: NAVEGACION -> ESCAPE_CONTORNO | ESCAPE_SUBMETA -> NAVEGACION.
+    """Maquina de estados: NAVEGACION -> ESCAPE_CONTORNO | ESCAPE_SUBMETA
+    (-> CAMINO_MAPA) -> NAVEGACION.
 
     El piloto P02 (decidir) sigue actuando en todos los estados, con su
-    seguridad: el supervisor solo cambia la meta (submeta) o el rumbo
-    (contorno). Cada nuevo intento usa el lado contrario al anterior.
+    seguridad: el supervisor solo cambia la meta (puntos del camino del mapa
+    o submetas). Cada nuevo intento de submeta usa el lado contrario.
     """
     def __init__(self, config):
         self.config = config
@@ -1170,29 +1275,80 @@ class Supervisor:
         self.estado = "NAVEGACION"
         self.escapes = self.detectados = self.fallidos = 0
         self.rodeo = 0  # +1 rodear por la izquierda, -1 por la derecha.
-        self.lado = 0  # Lado de la pared en el contorno (+1 izquierda).
         self.inicio = self.distancia_inicio = 0.0
         self.submeta = None
+        self.mapa = MapaTemporal()
+        self.minimo = (0.0, 0.0)  # Donde se detecto el ultimo minimo local.
+        self.dentro = False  # Robot dentro de la U (envolvente del mapa).
+        self.t_plan, self.version_plan = 0.0, -1
+        self.lado_camino = 0  # Lado (+1 izquierda) del primer camino del mapa.
+        self.pendientes = []  # Submetas que faltan tras la actual.
+        self.extras = []  # Submetas lateral y de avance (fuera de la U).
+        self.trayectoria = deque(maxlen=400)  # Puntos recorridos cada PASO_TRAYECTORIA.
 
     def pilotar(self, lectura, rampa, esquiva, t, dt):
         c, pose = self.config, lectura.pose
         distancia = math.hypot(c.meta_x-pose.x, c.meta_y-pose.y)
         evento = self.comprobar_fin(pose, distancia, esquiva, t) if self.estado != "NAVEGACION" else ""
-        if self.estado == "ESCAPE_CONTORNO":
-            decision = decidir(lectura, c, rampa, esquiva, dt, contorno=self.lado)
-        elif self.estado == "ESCAPE_SUBMETA":
-            submeta = replace(c, meta_x=self.submeta[0], meta_y=self.submeta[1],
-                              meta_theta=None, tolerancia=TOLERANCIA_SUBMETA)
-            decision = decidir(lectura, submeta, rampa, esquiva, dt)
-            if decision.estado == "LLEGADA":
-                evento = self.terminar("Submeta alcanzada: vuelta a la meta real")
+        if not self.trayectoria or math.hypot(pose.x-self.trayectoria[-1][0],
+                                              pose.y-self.trayectoria[-1][1]) >= PASO_TRAYECTORIA:
+            self.trayectoria.append((pose.x, pose.y))
+        self.mapa.actualizar(pose, lectura.filtradas, c.angulos_ir)
+        if self.estado in ("ESCAPE_CONTORNO", "CAMINO_MAPA"):
+            # Camino del mapa; se rehace si los IR ven paredes nuevas.
+            if self.mapa.version != self.version_plan and t-self.t_plan >= REPLANIFICAR:
+                self.planificar(pose, t)
+            dentro = self.dentro
+            # Rodeado de paredes a RADIO_CONCAVIDAD del robot (como el detector).
+            # Con la envolvente alrededor del minimo, los demas obstaculos de la
+            # zona la agrandaban y el robot seguia "dentro" y lento lejos de la
+            # U (20261103_171631).
+            # Una vez fuera, fuera: al pasar de nuevo junto a la boca volvia a
+            # ponerse amarillo (20261103_173601).
+            self.dentro = self.dentro and self.mapa.dentro((pose.x, pose.y), (pose.x, pose.y),
+                                                           RADIO_CONCAVIDAD)
+            decision = self.hacia_submetas(lectura, rampa, esquiva, dt)
+            if decision is None and distancia > FINAL_P02+TOLERANCIA_SUBMETA:
+                # Camino agotado lejos de la meta (era la ruta de reserva por
+                # el rastro): otro camino, no volver al piloto P02.
+                self.planificar(pose, t)
+                decision = self.hacia_submetas(lectura, rampa, esquiva, dt)
+            if decision is None:
+                evento = self.terminar("Camino del mapa completado")
                 decision = decidir(lectura, c, rampa, esquiva, dt)
+            elif dentro and not self.dentro:
+                evento = "Fuera de la U: rodeandola por el mapa"
+        elif self.estado == "ESCAPE_SUBMETA":
+            saliendo = self.saliendo
+            decision = self.hacia_submetas(lectura, rampa, esquiva, dt)
+            if decision is None:
+                # Hasta la meta por el camino del mapa, como el contorno: con
+                # el piloto P02 volvia a esquivar detecciones sueltas y a
+                # disparar el detector de camino a la meta (20261103_170319).
+                self.estado = "CAMINO_MAPA"
+                self.planificar(pose, t)
+                evento = "Submetas alcanzadas: camino del mapa hasta la meta"
+                decision = self.hacia_submetas(lectura, rampa, esquiva, dt)
+                if decision is None:
+                    evento = self.terminar("Camino del mapa completado")
+                    decision = decidir(lectura, c, rampa, esquiva, dt)
+            elif saliendo and not self.saliendo:
+                evento = (f"Fuera de la U: submeta lateral "
+                          f"({self.submeta[0]*100:.0f}, {self.submeta[1]*100:.0f}) cm")
         else:
             decision = decidir(lectura, c, rampa, esquiva, dt)
             if (decision.estado not in ("LLEGADA", "ORIENTACION_FINAL")
                     and self.detector.actualizar(t, distancia, c)):
-                evento = self.minimo_detectado(pose, distancia, esquiva, t)
-        meta = self.submeta if self.estado == "ESCAPE_SUBMETA" else (c.meta_x, c.meta_y)
+                # Sin progreso no basta: rodeando un objeto suelto el robot
+                # tambien se aleja un rato (20261103_165849, 165652). En un
+                # minimo local (U) esta rodeado de paredes: dentro de la
+                # envolvente del mapa cercano. Con un objeto convexo, nunca.
+                if self.mapa.dentro((pose.x, pose.y), (pose.x, pose.y), RADIO_CONCAVIDAD):
+                    evento = self.minimo_detectado(pose, distancia, esquiva, t)
+                else:
+                    self.detector.reiniciar()
+                    evento = "Sin progreso, pero sin paredes alrededor: no es minimo local"
+        meta = self.submeta if self.estado != "NAVEGACION" and self.submeta else (c.meta_x, c.meta_y)
         return replace(decision, distancia=distancia, supervisor=self.estado, escapes=self.escapes,
                        meta_activa=meta, evento="; ".join(e for e in (decision.evento, evento) if e))
 
@@ -1204,24 +1360,45 @@ class Supervisor:
             return "Minimo local detectado (recuperacion desactivada)"
         if self.escapes >= c.max_escapes:
             return "Minimo local detectado: limite de escapes alcanzado"
-        # Primer intento: el lado por el que ya rodeaba (+1 izquierda);
-        # despues, alternar.
-        self.rodeo = (esquiva.lado or 1) if not self.rodeo else -self.rodeo
         self.escapes += 1
         self.inicio, self.distancia_inicio = t, distancia
+        self.minimo = (pose.x, pose.y)
+        self.lado_camino = 0
         if c.estrategia_escape == "contorno":
-            # Rodear por la izquierda deja la pared a la derecha.
-            self.lado = -self.rodeo
-            esquiva.rumbo, esquiva.busqueda = None, 0.0
             self.estado = "ESCAPE_CONTORNO"
-            pared = "izquierda" if self.lado > 0 else "derecha"
-            return f"Minimo local: escape {self.escapes} por contorno, pared a la {pared}"
-        rumbo = math.atan2(c.meta_y-pose.y, c.meta_x-pose.x)+self.rodeo*ANGULO_SUBMETA
-        self.submeta = (pose.x+c.distancia_submeta*math.cos(rumbo),
-                        pose.y+c.distancia_submeta*math.sin(rumbo))
+            self.dentro = self.mapa.dentro(self.minimo, self.minimo, RADIO_CONCAVIDAD)
+            n = self.planificar(pose, t)
+            return (f"Minimo local: escape {self.escapes} por contorno con el mapa "
+                    f"({len(self.mapa.ocupadas)} celdas ocupadas, camino de {n} puntos)")
+        # Submetas: salir de la U deshaciendo el rastro (ruta_de_salida). Ir
+        # en linea recta a la salida cortaba la esquina de la U (20261103_162735).
+        ruta = self.ruta_de_salida(pose)
+        retro = ruta[-1]
+        # Tramo 2: a un lado, perpendicular a la meta, fuera del ancho de la U.
+        # Tramo 3: en paralelo a la U hasta dejarla atras. Desde la lateral
+        # derecho a la meta se cruzaba la punta del brazo (simulacion).
+        # Lado y distancias segun lo que el mapa sabe de la U: el lado salia
+        # del giro del momento y una vez rodeo por donde habia mas obstaculos
+        # (20261103_165141). Despues de un intento fallido, el otro lado.
+        meta = math.atan2(c.meta_y-retro[1], c.meta_x-retro[0])
+        izquierda, derecha = self.medir_u(retro, meta)
+        if self.rodeo:
+            self.rodeo = -self.rodeo
+        elif abs(izquierda-derecha) > CELDA_MAPA*2:
+            self.rodeo = 1 if izquierda < derecha else -1
+        else:
+            self.rodeo = esquiva.lado or 1
+        # Lo justo para librar la U; despues el camino del mapa la rodea (con
+        # 1 m fijo y otro punto de avance el robot se iba lejisimos: 171356).
+        aparte = max(c.distancia_submeta, (izquierda if self.rodeo > 0 else derecha)+HOLGURA_SUBMETA)
+        lateral = (retro[0]+aparte*math.cos(meta+self.rodeo*math.pi/2),
+                   retro[1]+aparte*math.sin(meta+self.rodeo*math.pi/2))
+        self.extras = [lateral]
+        self.submeta, self.pendientes = ruta[0], ruta[1:]+self.extras
         self.estado = "ESCAPE_SUBMETA"
-        return (f"Minimo local: escape {self.escapes} por submeta "
-                f"({self.submeta[0]*100:.0f}, {self.submeta[1]*100:.0f}) cm")
+        return (f"Minimo local: escape {self.escapes} por submetas: retroceso a "
+                f"({retro[0]*100:.0f}, {retro[1]*100:.0f}) cm y lateral a "
+                f"({lateral[0]*100:.0f}, {lateral[1]*100:.0f}) cm")
 
     def comprobar_fin(self, pose, distancia, esquiva, t):
         c = self.config
@@ -1230,23 +1407,143 @@ class Supervisor:
         if t-self.inicio >= c.tiempo_max_escape:
             self.fallidos += 1
             return self.terminar("Escape agotado sin salir: el siguiente intento cambia de lado")
-        if self.estado == "ESCAPE_CONTORNO" and distancia <= self.distancia_inicio-c.margen_salida:
-            # Bug2: mas cerca de la meta que al detectar el minimo y con el
-            # corredor hacia la meta libre de puntos en memoria.
-            distancias, angulos = esquiva.memoria.virtuales(pose)
-            distancias = [antes_de_meta(d, distancia) for d in distancias]
-            dx, dy = a_local(c.meta_x-pose.x, c.meta_y-pose.y, pose.theta)
-            if via_libre(distancias, angulos, math.atan2(dy, dx), c):
-                return self.terminar("Fin del contorno: mas cerca de la meta y camino libre")
+        # El contorno no vuelve al piloto P02 a mitad de camino: P02 no usa el
+        # mapa y volvia a meterse en la U (20261103_165429). Sigue el camino
+        # del mapa hasta la meta.
         return ""
+
+    def hacia_submetas(self, lectura, rampa, esquiva, dt):
+        """Piloto P02 hacia la submeta actual; alcanzada, a la siguiente.
+
+        None cuando no quedan. Nunca devuelve LLEGADA: la mision acababa en
+        un punto del rastro como si fuera la meta (simulacion).
+        """
+        rampa_antes = rampa.actual, rampa.giro
+        while self.submeta is not None:
+            sub = replace(self.config, meta_x=self.submeta[0], meta_y=self.submeta[1],
+                          meta_theta=None, tolerancia=TOLERANCIA_SUBMETA)
+            contorno = self.estado in ("ESCAPE_CONTORNO", "CAMINO_MAPA")
+            # Todo el escape va derecho a sus puntos (seguridad frontal intacta):
+            # hacia la submeta lateral, el piloto P02 lo desviaba por lo que
+            # recordaba y se alejaba de mas (20261103_171356).
+            decision = decidir(lectura, sub, rampa, esquiva, dt, directo=True,
+                               lento=self.dentro if contorno else self.saliendo)
+            if decision.estado != "LLEGADA":
+                return decision
+            # Un punto intermedio no es parar: LLEGADA ponia la rampa a cero y
+            # el robot arrancaba de nuevo cada 20 cm a 3 cm/s (20261103_170106).
+            rampa.actual, rampa.giro = rampa_antes
+            self.submeta = self.pendientes.pop(0) if self.pendientes else None
+        return None
+
+    @property
+    def saliendo(self):
+        """Saliendo de la U (luz amarilla): en el contorno, dentro de la
+        envolvente del mapa; con submetas, recorriendo el rastro."""
+        if self.estado == "ESCAPE_CONTORNO":
+            return self.dentro
+        return (self.estado == "ESCAPE_SUBMETA" and self.submeta is not None
+                and self.submeta not in self.extras)
+
+    def ruta_de_salida(self, pose):
+        """Camino de ENTRADA deshecho: puntos del rastro cada PASO_RUTA, desde
+        la primera vez que el robot paso cerca de aqui hacia atras, hasta uno
+        a RETROCESO o mas de aqui en linea recta.
+
+        Ir en linea recta a ese punto cortaba la esquina de la U y el robot
+        choco con el brazo (20261103_162735): el rastro en cambio esta libre.
+        Empezar por la primera pasada deja fuera las vueltas dentro de la U;
+        recorrerlas otra vez devolvia el robot al fondo (20261103_163114).
+        """
+        puntos = list(self.trayectoria)
+        lejos = [i for i, q in enumerate(puntos) if math.hypot(q[0]-pose.x, q[1]-pose.y) >= RETROCESO]
+        inicio = lejos[-1] if lejos else 0
+        entrada = next((i for i in range(inicio, len(puntos))
+                        if math.hypot(puntos[i][0]-pose.x, puntos[i][1]-pose.y) <= CERCA_RASTRO),
+                       len(puntos)-1)
+        ruta, ultimo = [], (pose.x, pose.y)
+        for q in reversed(puntos[inicio:entrada+1]):
+            if math.hypot(q[0]-ultimo[0], q[1]-ultimo[1]) >= PASO_RUTA:
+                ruta.append(q)
+                ultimo = q
+        if puntos and (not ruta or ruta[-1] != puntos[inicio]):
+            ruta.append(puntos[inicio])
+        return ruta or [(pose.x, pose.y)]
+
+    def medir_u(self, origen, rumbo):
+        """Cuanto sobresale la U (lo ocupado a menos de RADIO_U del minimo) a
+        la izquierda y a la derecha de la recta origen-rumbo."""
+        ux, uy = math.cos(rumbo), math.sin(rumbo)
+        izquierda = derecha = 0.0
+        for cx, cy in self.mapa.ocupadas:
+            x, y = cx*CELDA_MAPA, cy*CELDA_MAPA
+            if math.hypot(x-self.minimo[0], y-self.minimo[1]) > RADIO_U:
+                continue
+            lado = (x-origen[0])*-uy+(y-origen[1])*ux
+            izquierda, derecha = max(izquierda, lado), max(derecha, -lado)
+        return izquierda, derecha
+
+    def lateral(self, q):
+        """Distancia con signo (+ izquierda) de q a la recta minimo -> meta."""
+        c = self.config
+        ux, uy = c.meta_x-self.minimo[0], c.meta_y-self.minimo[1]
+        n = math.hypot(ux, uy) or 1.0
+        return ((q[0]-self.minimo[0])*-uy+(q[1]-self.minimo[1])*ux)/n
+
+    def otro_lado(self):
+        """Funcion (x, y) -> True en el lado contrario al del primer camino,
+        cerca de la U: alli el camino cuesta mas y no cambia de lado por un
+        obstaculo nuevo (20261103_173601: salio por el oeste, vio otro objeto
+        y cruzo por delante de la U al este). None antes del primer camino."""
+        if not self.lado_camino:
+            return None
+        return lambda x, y: (math.hypot(x-self.minimo[0], y-self.minimo[1]) <= ZONA_LADO
+                             and self.lado_camino*self.lateral((x, y)) < -RADIO_ROBOT)
+
+    def planificar(self, pose, t):
+        """Camino del mapa hasta la meta con holgura = radio IR + distancia_pared
+        (los IR verian la pared a distancia_pared). Sin camino, el rastro."""
+        c = self.config
+        camino = None
+        for holgura in (RADIO_IR+c.distancia_pared, RADIO_IR+c.distancia_pared-0.04, RADIO_ROBOT+0.03):
+            camino = self.mapa.camino((pose.x, pose.y), (c.meta_x, c.meta_y), holgura,
+                                      self.mapa.envolvente(self.minimo, RADIO_U), self.otro_lado())
+            if camino is not None:
+                break
+        if camino is not None:
+            # El ultimo tramo, con el piloto P02, que frena al llegar: siguiendo
+            # el camino hasta 15 cm de la meta llegaba lanzado y daba una vuelta.
+            camino = [q for q in camino if math.hypot(q[0]-c.meta_x, q[1]-c.meta_y) > FINAL_P02]
+        if camino is None and self.submeta is None:
+            camino = self.ruta_de_salida(pose)
+        if camino and not self.lado_camino:
+            # Primer camino: su lado de la recta minimo-meta queda elegido.
+            self.lado_camino = 1 if sum(self.lateral(q) for q in camino) > 0 else -1
+        if camino:
+            self.submeta, self.pendientes = camino[0], camino[1:]
+        elif camino is not None:
+            self.submeta, self.pendientes = None, []  # Ya en el tramo final.
+        self.t_plan, self.version_plan = t, self.mapa.version
+        return len(camino) if camino else 0
 
     def terminar(self, motivo):
         self.estado = "NAVEGACION"
+        self.submeta, self.dentro = None, False
         self.detector.reiniciar()
         return motivo
 
 
-ANGULO_SUBMETA = 3*math.pi/4  # Submeta hacia atras y a un lado: fuera de la U.
+RETROCESO = 0.8  # m: distancia del punto de la trayectoria al que se retrocede.
+REPLANIFICAR = 1.0  # s minimos entre dos caminos del mapa (si el mapa cambia).
+COSTE_OTRO_LADO = 4.0  # Coste extra por celda en el otro lado de la U (compromiso de lado).
+ZONA_LADO = 2.0  # m alrededor del minimo en que cuenta el compromiso de lado.
+RADIO_CONCAVIDAD = 1.0  # m: paredes que cuentan para decidir si el robot esta rodeado.
+FINAL_P02 = 0.4  # m: el camino del mapa acaba aqui; la llegada la hace el piloto P02.
+PASO_TRAYECTORIA = 0.05  # m entre puntos guardados de la trayectoria.
+PASO_RUTA = 0.2  # m entre puntos de la ruta de salida por el rastro.
+HOLGURA_SUBMETA = 0.45  # m: radio del robot + margen sobre lo que sobresale la U.
+RADIO_U = 1.5  # m alrededor del minimo en que lo ocupado se considera la U.
+CERCA_RASTRO = 0.25  # m: primera pasada por aqui = punto donde empieza la ruta de salida.
 
 
 class Registro:
@@ -1313,6 +1610,12 @@ class Registro:
                  "ciclos_lentos": self.ciclos_tarde, "plazos_omitidos": self.plazos_omitidos,
                  "nota": "Minima IR estimada, no separacion de todo el chasis. Velocidad odometrica estimada; ciclo lento dt > 1.05*Ts."}
         (self.carpeta/"resultado.json").write_text(json.dumps(datos, indent=2), encoding="utf-8")
+        # Mapa temporal (celdas ocupadas) para dibujar la U y el recorrido.
+        with open(self.carpeta/"mapa.csv", "w", newline="", encoding="utf-8") as archivo:
+            escritor = csv.writer(archivo)
+            escritor.writerow(("x_m", "y_m"))
+            escritor.writerows((round(cx*CELDA_MAPA, 3), round(cy*CELDA_MAPA, 3))
+                               for cx, cy in sorted(supervisor.mapa.ocupadas))
 
 
 async def navegar(adaptador, config, calibrador):
@@ -1337,6 +1640,7 @@ async def navegar(adaptador, config, calibrador):
             if "Minimo local" in decision.evento:
                 print(f"{ahora-inicio:6.1f} s  {decision.evento}")
             await adaptador.aplicar(*decision.comando[:2])
+            await adaptador.luz(AMARILLO if supervisor.saliendo else AZUL)
             registro.ciclo(ahora-inicio, ahora-anterior, lectura, decision, max(0, ahora-plazo), config)
             if decision.estado == "LLEGADA":
                 resultado = "meta_alcanzada"
@@ -1366,7 +1670,9 @@ async def navegar(adaptador, config, calibrador):
 
 
 # ADAPTADOR: LAS UNIDADES DEL SDK SE CONVIERTEN SOLO EN ESTE LIMITE.
+AZUL, AMARILLO = (0, 0, 255), (255, 200, 0)  # Navegando / saliendo de un minimo local.
 INTENTOS_PRIMERA_LECTURA = 3  # Solo con el robot parado, antes de la primera pose.
+INTENTOS_LECTURA = 3  # En marcha: parar y reintentar antes de abortar (20261103_160033).
 
 
 class Adaptador:
@@ -1376,6 +1682,7 @@ class Adaptador:
         self.detector = DetectorIR(calibrador, config)
         self.colision = False
         self.origen_sdk = None
+        self.color = AZUL  # Puesto en iniciar() antes de navegar.
 
     def comprobar_seguridad(self):
         if self.colision:
@@ -1387,7 +1694,9 @@ class Adaptador:
         # En serie el ciclo real era ~0.4 s, demasiado para reaccionar con IR de 25 cm.
         # La primera lectura (robot parado) se reintenta: en 20261103_103743 y
         # 103821 no respondio en 2 s y la mision acababa sin ningun ciclo.
-        intentos = INTENTOS_PRIMERA_LECTURA if self.origen_sdk is None else 1
+        # En marcha, un corte de 2 s abortaba la mision con el robot ya fuera
+        # de la U (20261103_160033): ahora se para y se reintenta.
+        intentos = INTENTOS_PRIMERA_LECTURA if self.origen_sdk is None else INTENTOS_LECTURA
         p = ir = None
         for intento in range(1, intentos+1):
             try:
@@ -1395,12 +1704,19 @@ class Adaptador:
                     asyncio.gather(self.robot.get_position(), self.robot.get_ir_proximity()),
                     self.config.timeout_lectura)
                 break
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, ValueError):
+                # ValueError "coroutine already executing": el SDK tras un
+                # corte a mitad de una orden (20261103_165652).
                 if intento == intentos:
                     raise TimeoutError(
                         f"El robot no respondio a la lectura de odometria e IR en "
                         f"{self.config.timeout_lectura:g} s ({intentos} intento/s): revise el Bluetooth") from None
-                print(f"Lectura inicial sin respuesta; reintento {intento}/{intentos-1}")
+                print(f"Lectura sin respuesta; reintento {intento}/{intentos-1}")
+                if self.origen_sdk is not None:
+                    try:
+                        await self.parar()  # No seguir a ciegas con la ultima orden.
+                    except (asyncio.TimeoutError, ValueError):
+                        pass
         if p is None or not all(math.isfinite(v) for v in (p.x, p.y, p.heading)):
             raise RuntimeError("Odometria no disponible")
         tiempo_pose = time.monotonic()
@@ -1422,13 +1738,27 @@ class Adaptador:
 
     async def aplicar(self, izq, der):
         self.comprobar_seguridad()
-        await asyncio.wait_for(self.robot.set_wheel_speeds(100*izq, 100*der), self.config.timeout_lectura)
+        try:
+            await asyncio.wait_for(self.robot.set_wheel_speeds(100*izq, 100*der), self.config.timeout_lectura)
+        except (asyncio.TimeoutError, ValueError):
+            # Un corte Bluetooth puntual: un reintento antes de abortar.
+            await asyncio.wait_for(self.robot.set_wheel_speeds(100*izq, 100*der), self.config.timeout_lectura)
         if self.colision:
             await self.parar()
             self.comprobar_seguridad()
 
     async def parar(self):
         await asyncio.wait_for(self.robot.set_wheel_speeds(0, 0), self.config.timeout_lectura)
+
+    async def luz(self, rgb):
+        """Cambia el anillo de luz solo si cambia el color (una orden Bluetooth)."""
+        if rgb == self.color:
+            return
+        try:
+            await asyncio.wait_for(self.robot.set_lights_on_rgb(*rgb), self.config.timeout_lectura)
+            self.color = rgb
+        except (asyncio.TimeoutError, ValueError):
+            pass  # La luz no debe parar la mision; se reintenta en el ciclo siguiente.
 
 
 def ejecutar(config, calibrador):
@@ -1453,7 +1783,7 @@ def ejecutar(config, calibrador):
             await asyncio.sleep(0.2)
             await r.set_lights_on_rgb(0, 255, 0)
             # Abrir registro antes de la primera lectura: registrar tambien fallos iniciales.
-            await r.set_lights_on_rgb(0, 0, 255)
+            await r.set_lights_on_rgb(*AZUL)
             resultado = await navegar(adaptador, config, calibrador)
             print(resultado)
             if resultado == "meta_alcanzada":
