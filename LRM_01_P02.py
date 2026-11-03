@@ -447,6 +447,8 @@ def a_local(fx, fy, theta):
     return c*fx+s*fy, -s*fx+c*fy
 
 
+INTENSIDAD_MINIMA = 20.0  # Por debajo, ruido del sensor y no un obstaculo.
+
 MUESTRAS_IR = {
     5: [1377, 1350, 902.7, 1517, 1111, 1031.5, 1103],
     7.5: [512, 674, 415, 680, 460.2, 363, 461.1],
@@ -471,6 +473,12 @@ class CalibradorIR:
         self.tablas = [tuple((fila[i], d/100) for d, fila in self.muestras.items()) for i in range(7)]
         if any(any(a[0] <= b[0] for a, b in zip(t, t[1:])) for t in self.tablas):
             raise ValueError("La intensidad de cada sensor debe disminuir con la distancia")
+        # Umbral de deteccion por sensor: el extremo de la tabla, pero nunca
+        # por debajo del ruido. El IR 6 marca 15.6 a 20 cm y 15.1 a 25 cm, su
+        # nivel de ruido (lee hasta 17 sin nada delante): el ruido aparecia
+        # como obstaculo a 19 cm, la memoria lo guardaba 10 s y apartaba al
+        # robot de la meta (20261103_113635).
+        self.umbrales = tuple(max(t[-1][0], INTENSIDAD_MINIMA) for t in self.tablas)
 
     def validar_configuracion(self, config):
         minimo, maximo = min(self.muestras)/100, max(self.muestras)/100
@@ -481,11 +489,11 @@ class CalibradorIR:
     def convertir(self, valores):
         if len(valores) != 7 or any(v is None or not math.isfinite(v) or v < 0 for v in valores):
             raise RuntimeError("Lectura IR invalida; se detiene la mision")
-        return tuple(self.distancia(v, t) for v, t in zip(valores, self.tablas))
+        return tuple(self.distancia(v, t, u) for v, t, u in zip(valores, self.tablas, self.umbrales))
 
     @staticmethod
-    def distancia(valor, tabla):
-        if valor < tabla[-1][0]:
+    def distancia(valor, tabla, umbral):
+        if valor < umbral:
             return math.inf  # Sin deteccion util, no una medida de 50 cm.
         if valor >= tabla[0][0]:
             return tabla[0][1]  # Saturacion cercana; activa la parada de seguridad.
@@ -506,7 +514,7 @@ class DetectorIR:
     """
     def __init__(self, calibrador, config):
         self.config = config
-        self.umbrales = tuple(t[-1][0] for t in calibrador.tablas)
+        self.umbrales = calibrador.umbrales
         self.alcance = max(calibrador.muestras)/100
         self.cuentas = [0]*7
         self.activas = [False]*7
@@ -556,6 +564,11 @@ def magnitud_repulsiva(distancia, config):
     return u, min(magnitud, config.fuerza_max_sensor)
 
 
+def bloquea(distancia, angulo):
+    """Punto por delante y dentro del corredor que barre el robot al avanzar."""
+    return math.cos(angulo) > 0 and abs((RADIO_IR+distancia)*math.sin(angulo)) <= CORREDOR
+
+
 def repulsion(distancias, config, angulos=None):
     """Khatib: U=k/2*(1/d-1/d0)^2; alternativa U=k/2*(1-d/d0)^2.
 
@@ -566,10 +579,10 @@ def repulsion(distancias, config, angulos=None):
 
     Corredor de paso: un punto por delante cuya separacion lateral supera
     CORREDOR, o uno de detras, no esta en la trayectoria; solo empuja de lado
-    (centra el robot entre dos obstaculos) y no frena ni empuja hacia delante. En un paso estrecho los dos bordes
-    frenaban mas que la atraccion y el robot giraba sin entrar
-    (20261103_105824). Devuelve (U, Fx, Fy, Bx, By): B es la parte de los
-    puntos que SI bloquean la trayectoria, la unica que activa el rodeo.
+    (centra el robot entre dos obstaculos) y no frena ni empuja hacia delante.
+    En un paso estrecho los dos bordes frenaban mas que la atraccion y el
+    robot giraba sin entrar (20261103_105824). Devuelve (U, Fx, Fy, Bx, By):
+    B es la parte de los puntos que SI bloquean la trayectoria.
     """
     fx = fy = bx = by = potencial = 0.0
     for distancia, angulo in zip(distancias, config.angulos_ir if angulos is None else angulos):
@@ -579,8 +592,7 @@ def repulsion(distancias, config, angulos=None):
         potencial += punto[0]
         magnitud = punto[1]
         px, py = magnitud*math.cos(angulo), magnitud*math.sin(angulo)
-        lateral = (RADIO_IR+distancia)*math.sin(angulo)
-        if px > 0 and abs(lateral) <= CORREDOR:
+        if bloquea(distancia, angulo):
             bx, by = bx-px, by-py
         else:
             # Fuera del corredor o detras: solo empuje lateral. Los puntos de
@@ -592,7 +604,13 @@ def repulsion(distancias, config, angulos=None):
 
 
 RADIO_IR = 0.154  # m del centro a los emisores IR (URDF): origen de cada distancia.
-CORREDOR = 0.20  # m: semiancho barrido al avanzar (radio Create 3 ~0.17 + 3 cm).
+RADIO_ROBOT = 0.17  # m: radio del chasis Create 3.
+CORREDOR = RADIO_ROBOT+0.03  # m: semiancho barrido al avanzar.
+
+
+def antes_de_meta(distancia_ir, distancia_meta):
+    """La distancia IR si el punto puede tocarse de camino a la meta; si no, inf."""
+    return distancia_ir if RADIO_IR+distancia_ir < distancia_meta+RADIO_ROBOT else math.inf
 CELDA_MEMORIA = 0.03  # m: puntos mas proximos se funden en uno.
 SECTOR_MEMORIA = math.radians(30)  # Un sensor virtual por sector alrededor del robot.
 
@@ -668,29 +686,46 @@ class MemoriaEsquiva:
         return self.lado
 
 
-def tangencial(distancias, angulos, lado, config):
-    """F_rep de cada punto girada 90 grados: bordear el obstaculo.
+def tangencial(distancias, angulos, config):
+    """F_rep de cada punto lateral girada 90 grados: bordear el obstaculo.
 
-    Puntos en el corredor (bloquean): sentido del lado de rodeo memorizado,
-    para no dudar frente a un obstaculo centrado. Resto: dejar el punto en
-    su lado (a la derecha se rodea por la izquierda y viceversa); con un
-    obstaculo a cada lado ambos empujan hacia delante y el robot pasa por el
-    medio. Con un lado fijo para todo, la pared del otro lado empujaba HACIA
-    ATRAS y el robot giraba sin pasar. Elegir el sentido hacia la meta se
-    probo en simulacion y alternaba de lado en cada ciclo: peor.
+    Cada punto se deja en su lado (a la derecha se rodea por la izquierda y
+    viceversa); con un obstaculo a cada lado ambos empujan hacia delante y
+    el robot pasa por el medio. Con un lado fijo para todo, la pared del otro
+    lado empujaba HACIA ATRAS y el robot giraba sin pasar. Elegir el sentido
+    hacia la meta se probo en simulacion y alternaba de lado en cada ciclo.
+    Los puntos que bloquean no cuentan: los resuelve desvio().
     """
     tx = ty = 0.0
     for distancia, angulo in zip(distancias, angulos):
         punto = magnitud_repulsiva(distancia, config)
-        if punto is None:
+        if punto is None or bloquea(distancia, angulo):
             continue
-        lateral = (RADIO_IR+distancia)*math.sin(angulo)
-        bloquea = math.cos(angulo) > 0 and abs(lateral) <= CORREDOR
-        sentido = lado if bloquea else (1 if lateral < 0 else -1)
+        sentido = 1 if math.sin(angulo) < 0 else -1
         k = sentido*config.ganancia_tangencial*punto[1]
         tx -= k*math.sin(angulo)
         ty += k*math.cos(angulo)
     return tx, ty
+
+
+def desvio(distancias, angulos, lado, config):
+    """Rumbo local que deja cada punto que bloquea a CORREDOR del eje de avance.
+
+    Subobjetivo virtual: en vez de empujar contra el obstaculo, la atraccion
+    apunta a pasar por su lado (lado +1: izquierda). Para un punto a angulo a
+    y distancia r del centro: a + lado*asin(CORREDOR/r); con varios, el mas
+    exigente. None si nada bloquea. Con un sensor de mas alcance (LIDAR) el
+    desvio empezaria antes y el giro seria suave.
+    """
+    rumbo = None
+    for distancia, angulo in zip(distancias, angulos):
+        if magnitud_repulsiva(distancia, config) is None or not bloquea(distancia, angulo):
+            continue
+        r = RADIO_IR+distancia
+        psi = angulo+lado*math.asin(min(1.0, CORREDOR/r))
+        if rumbo is None or lado*(psi-rumbo) > 0:
+            rumbo = psi
+    return rumbo
 
 
 # INTERFAZ ESPECIFICA DE P02
@@ -800,6 +835,7 @@ MARGEN_GIRO = 0.03  # m de histeresis para dejar de girar y volver a avanzar.
 ANGULO_FRONTAL = 0.5  # rad: sensores que miran al frente (0 y +-25 grados).
 ANGULO_DELANTE = 1.0  # rad: sensores en la trayectoria (0, +-25 y +-50 grados).
 RETRASO_MAX = 0.8  # s: un ciclo mas largo no se usa para predecir el giro.
+LIMITE_LATERAL = 2.0  # Empuje lateral maximo, en veces la atraccion (simulacion).
 
 
 def decidir(lectura, config, rampa, esquiva, dt):
@@ -812,27 +848,51 @@ def decidir(lectura, config, rampa, esquiva, dt):
     # cuando el obstaculo pasa a la zona ciega lateral o trasera.
     esquiva.memoria.actualizar(pose, lectura.filtradas, lectura.tiempo_pose, config)
     distancias_mem, angulos_mem = esquiva.memoria.virtuales(pose)
+    # Un punto a mas de distancia+RADIO_ROBOT del centro no se puede tocar de
+    # camino a la meta (desigualdad triangular): se ignora. A 12 cm de la meta
+    # el robot giraba sin parar por detecciones a 31-34 cm (20261103_114224).
+    distancias_mem = [antes_de_meta(d, distancia) for d in distancias_mem]
+    distancias = tuple(antes_de_meta(d, distancia) for d in lectura.distancias)
     ur, rx, ry, bx, by = repulsion(distancias_mem, config, angulos_mem)
     rep = (rx, ry)
     # Rodeo solo frente a lo que bloquea la trayectoria: con la repulsion
     # total y la memoria el lado no se liberaba nunca y el robot orbitaba.
     lado = esquiva.actualizar((bx, by), atr, dt, config)
-    tan = tangencial(distancias_mem, angulos_mem, lado, config)
-    res = (atr[0]+rx+tan[0], atr[1]+ry+tan[1])
+    # Lo que bloquea no empuja: la atraccion, con su modulo, apunta al rumbo
+    # que lo deja a un lado. Antes la repulsion (~5) y la atraccion (~0.3) se
+    # peleaban y el robot rebotaba lejos del obstaculo antes de rodearlo.
+    # Los puntos que bloquean siguen limitando la velocidad y el giro en el sitio.
+    rumbo = desvio(distancias_mem, angulos_mem, lado, config) if lado else None
+    guia = atr
+    if rumbo is not None:
+        meta_local = math.atan2(atr[1], atr[0])
+        if lado*(rumbo-meta_local) > 0:
+            modulo = math.hypot(*atr)
+            guia = (modulo*math.cos(rumbo), modulo*math.sin(rumbo))
+    # Empuje lateral y rodeo de lo que queda a los lados, como mucho
+    # LIMITE_LATERAL veces la atraccion: apartarse sin salir despedido.
+    tan = tangencial(distancias_mem, angulos_mem, config)
+    lateral = (rx-bx+tan[0], ry-by+tan[1])
+    tope = LIMITE_LATERAL*math.hypot(*atr)
+    if math.hypot(*lateral) > tope:
+        escala = tope/math.hypot(*lateral)
+        lateral = (lateral[0]*escala, lateral[1]*escala)
+        tan = (tan[0]*escala, tan[1]*escala)
+    res = (guia[0]+lateral[0], guia[1]+lateral[1])
     # Obstaculo delante o demasiado cerca: no abortar, no quedarse parado y no
     # confiar solo en el equilibrio de fuerzas (frente a un obstaculo centrado
     # la repulsion apenas gira). El chasis es circular: girar en el sitio no
     # acerca el contorno al obstaculo. Distancias sin filtrar: sin retraso.
     frontales = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_FRONTAL]
-    frontal = min(lectura.distancias[i] for i in frontales)
-    cercania = min(lectura.distancias)
+    frontal = min(distancias[i] for i in frontales)
+    cercania = min(distancias)
     if cercania <= config.seguridad or frontal <= config.distancia_giro:
         esquiva.girando = True
     elif cercania > config.seguridad+MARGEN_GIRO and frontal > config.distancia_giro+MARGEN_GIRO:
         esquiva.girando = False
     if esquiva.girando and distancia > config.tolerancia:
         if not esquiva.lado:
-            esquiva.lado = elegir_lado(repulsion(lectura.distancias, config)[1:3], atr)
+            esquiva.lado = elegir_lado(repulsion(distancias, config)[1:3], atr)
         esquiva.libre = 0.0
         rampa.actual = 0.0
         comando = ruedas(0, esquiva.lado*config.wmax, config)
@@ -855,10 +915,17 @@ def decidir(lectura, config, rampa, esquiva, dt):
     # o recordado detras mientras se rodea no se acerca al avanzar. Antes
     # cualquier deteccion imponia v_cerca y el 77% del recorrido iba a 5 cm/s.
     delante = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_DELANTE]
-    v = min(v, limite_por_percepcion([lectura.distancias[i] for i in delante], config, dt))
-    # Con un obstaculo delante (incluso por debajo del umbral calibrado)
-    # avanzar despacio: entre lectura y orden pasan ~2 ciclos.
-    if any(math.isfinite(lectura.distancias[i]) or lectura.presencia[i] for i in delante):
+    v = min(v, limite_por_percepcion([distancias[i] for i in delante], config, dt))
+    # Con un obstaculo delante avanzar despacio: entre lectura y orden pasan
+    # ~2 ciclos. La presencia (intensidad por debajo del umbral calibrado)
+    # solo en los frontales: el IR 6 (-50 grados) tiene umbral 15.1 y su ruido
+    # llega a 15; frenaba a v_cerca hasta el 40% del tiempo sin obstaculos
+    # (20261103_113443 y 113635).
+    # La presencia esta mas alla del alcance calibrado: tampoco cuenta si ese
+    # alcance ya queda detras de la meta.
+    presencia = math.isfinite(antes_de_meta(config.influencia, distancia))
+    if any(math.isfinite(distancias[i]) for i in delante) or (presencia and any(
+            lectura.presencia[i] for i in frontales)):
         v = min(v, config.v_cerca)
     v = rampa.limitar(v, dt, config)
     comando = ruedas(v, w, config)
