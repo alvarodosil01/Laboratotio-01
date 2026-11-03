@@ -41,7 +41,7 @@ class Configuracion:
     aceleracion: float = 0.30  # m/s2: aumento progresivo desde reposo.
     frenado: float = 0.50  # m/s2: parametro del perfil de aproximacion.
     separacion_ruedas: float = 0.235  # Heredada de T03: medir antes de validar.
-    tolerancia: float = 0.05
+    tolerancia: float = 0.05  # Con 3 cm daba vueltas alrededor de la meta.
     tolerancia_angular: float = math.radians(3)
     periodo: float = 0.10
     tiempo_max: float = 120.0
@@ -544,6 +544,18 @@ class FiltroIR:
         return self.anteriores
 
 
+def magnitud_repulsiva(distancia, config):
+    """(U, |F|) de un punto; None fuera de la influencia o sin deteccion."""
+    if not math.isfinite(distancia) or distancia >= config.influencia:
+        return None
+    d, d0, k = max(distancia, 0.005), config.influencia, config.ganancia_repulsiva
+    if config.repulsivo == "khatib":
+        u, magnitud = 0.5*k*(1/d-1/d0)**2, k*(1/d-1/d0)/d**2
+    else:
+        u, magnitud = 0.5*k*(1-d/d0)**2, k*(1-d/d0)/d0
+    return u, min(magnitud, config.fuerza_max_sensor)
+
+
 def repulsion(distancias, config, angulos=None):
     """Khatib: U=k/2*(1/d-1/d0)^2; alternativa U=k/2*(1-d/d0)^2.
 
@@ -551,25 +563,36 @@ def repulsion(distancias, config, angulos=None):
     La magnitud de cada fuerza se limita como regularizacion del controlador.
     Sus ganancias tienen distintas unidades: ajustar por separado.
     Sin angulos se usan los de los IR; con ellos, los de la memoria.
+
+    Corredor de paso: un punto por delante cuya separacion lateral supera
+    CORREDOR, o uno de detras, no esta en la trayectoria; solo empuja de lado
+    (centra el robot entre dos obstaculos) y no frena ni empuja hacia delante. En un paso estrecho los dos bordes
+    frenaban mas que la atraccion y el robot giraba sin entrar
+    (20261103_105824). Devuelve (U, Fx, Fy, Bx, By): B es la parte de los
+    puntos que SI bloquean la trayectoria, la unica que activa el rodeo.
     """
-    fx = fy = potencial = 0.0
+    fx = fy = bx = by = potencial = 0.0
     for distancia, angulo in zip(distancias, config.angulos_ir if angulos is None else angulos):
-        if not math.isfinite(distancia) or distancia >= config.influencia:
+        punto = magnitud_repulsiva(distancia, config)
+        if punto is None:
             continue
-        d, d0, k = max(distancia, 0.005), config.influencia, config.ganancia_repulsiva
-        if config.repulsivo == "khatib":
-            potencial += 0.5*k*(1/d-1/d0)**2
-            magnitud = k*(1/d-1/d0)/d**2
+        potencial += punto[0]
+        magnitud = punto[1]
+        px, py = magnitud*math.cos(angulo), magnitud*math.sin(angulo)
+        lateral = (RADIO_IR+distancia)*math.sin(angulo)
+        if px > 0 and abs(lateral) <= CORREDOR:
+            bx, by = bx-px, by-py
         else:
-            potencial += 0.5*k*(1-d/d0)**2
-            magnitud = k*(1-d/d0)/d0
-        magnitud = min(magnitud, config.fuerza_max_sensor)
-        fx -= magnitud*math.cos(angulo)
-        fy -= magnitud*math.sin(angulo)
-    return potencial, fx, fy
+            # Fuera del corredor o detras: solo empuje lateral. Los puntos de
+            # detras recordados empujaban hacia delante (~3 frente a 0.3 de
+            # atraccion) y el robot huia del paso tras girar en el sitio.
+            px = 0.0
+        fx, fy = fx-px, fy-py
+    return potencial, fx, fy, bx, by
 
 
 RADIO_IR = 0.154  # m del centro a los emisores IR (URDF): origen de cada distancia.
+CORREDOR = 0.20  # m: semiancho barrido al avanzar (radio Create 3 ~0.17 + 3 cm).
 CELDA_MEMORIA = 0.03  # m: puntos mas proximos se funden en uno.
 SECTOR_MEMORIA = math.radians(30)  # Un sensor virtual por sector alrededor del robot.
 
@@ -645,14 +668,29 @@ class MemoriaEsquiva:
         return self.lado
 
 
-def tangencial(rep, lado, config):
-    """F_rep girada 90 grados hacia el lado de rodeo: bordear el obstaculo.
+def tangencial(distancias, angulos, lado, config):
+    """F_rep de cada punto girada 90 grados: bordear el obstaculo.
 
-    Proporcional a la repulsion, luego nula sin deteccion: al dejar el
-    obstaculo atras solo queda la atraccion y el robot se reorienta a la meta.
+    Puntos en el corredor (bloquean): sentido del lado de rodeo memorizado,
+    para no dudar frente a un obstaculo centrado. Resto: dejar el punto en
+    su lado (a la derecha se rodea por la izquierda y viceversa); con un
+    obstaculo a cada lado ambos empujan hacia delante y el robot pasa por el
+    medio. Con un lado fijo para todo, la pared del otro lado empujaba HACIA
+    ATRAS y el robot giraba sin pasar. Elegir el sentido hacia la meta se
+    probo en simulacion y alternaba de lado en cada ciclo: peor.
     """
-    k = lado*config.ganancia_tangencial
-    return k*rep[1], -k*rep[0]
+    tx = ty = 0.0
+    for distancia, angulo in zip(distancias, angulos):
+        punto = magnitud_repulsiva(distancia, config)
+        if punto is None:
+            continue
+        lateral = (RADIO_IR+distancia)*math.sin(angulo)
+        bloquea = math.cos(angulo) > 0 and abs(lateral) <= CORREDOR
+        sentido = lado if bloquea else (1 if lateral < 0 else -1)
+        k = sentido*config.ganancia_tangencial*punto[1]
+        tx -= k*math.sin(angulo)
+        ty += k*math.cos(angulo)
+    return tx, ty
 
 
 # INTERFAZ ESPECIFICA DE P02
@@ -774,10 +812,12 @@ def decidir(lectura, config, rampa, esquiva, dt):
     # cuando el obstaculo pasa a la zona ciega lateral o trasera.
     esquiva.memoria.actualizar(pose, lectura.filtradas, lectura.tiempo_pose, config)
     distancias_mem, angulos_mem = esquiva.memoria.virtuales(pose)
-    ur, rx, ry = repulsion(distancias_mem, config, angulos_mem)
+    ur, rx, ry, bx, by = repulsion(distancias_mem, config, angulos_mem)
     rep = (rx, ry)
-    lado = esquiva.actualizar(rep, atr, dt, config)
-    tan = tangencial(rep, lado, config)
+    # Rodeo solo frente a lo que bloquea la trayectoria: con la repulsion
+    # total y la memoria el lado no se liberaba nunca y el robot orbitaba.
+    lado = esquiva.actualizar((bx, by), atr, dt, config)
+    tan = tangencial(distancias_mem, angulos_mem, lado, config)
     res = (atr[0]+rx+tan[0], atr[1]+ry+tan[1])
     # Obstaculo delante o demasiado cerca: no abortar, no quedarse parado y no
     # confiar solo en el equilibrio de fuerzas (frente a un obstaculo centrado
@@ -792,7 +832,7 @@ def decidir(lectura, config, rampa, esquiva, dt):
         esquiva.girando = False
     if esquiva.girando and distancia > config.tolerancia:
         if not esquiva.lado:
-            esquiva.lado = elegir_lado(repulsion(lectura.distancias, config)[1:], atr)
+            esquiva.lado = elegir_lado(repulsion(lectura.distancias, config)[1:3], atr)
         esquiva.libre = 0.0
         rampa.actual = 0.0
         comando = ruedas(0, esquiva.lado*config.wmax, config)
@@ -936,6 +976,9 @@ async def navegar(adaptador, config, calibrador):
 
 
 # ADAPTADOR: LAS UNIDADES DEL SDK SE CONVIERTEN SOLO EN ESTE LIMITE.
+INTENTOS_PRIMERA_LECTURA = 3  # Solo con el robot parado, antes de la primera pose.
+
+
 class Adaptador:
     def __init__(self, robot, config, calibrador):
         self.robot, self.config, self.calibrador = robot, config, calibrador
@@ -952,9 +995,22 @@ class Adaptador:
         self.comprobar_seguridad()
         # Peticiones simultaneas: el SDK empareja cada respuesta por su id.
         # En serie el ciclo real era ~0.4 s, demasiado para reaccionar con IR de 25 cm.
-        p, ir = await asyncio.wait_for(
-            asyncio.gather(self.robot.get_position(), self.robot.get_ir_proximity()),
-            self.config.timeout_lectura)
+        # La primera lectura (robot parado) se reintenta: en 20261103_103743 y
+        # 103821 no respondio en 2 s y la mision acababa sin ningun ciclo.
+        intentos = INTENTOS_PRIMERA_LECTURA if self.origen_sdk is None else 1
+        p = ir = None
+        for intento in range(1, intentos+1):
+            try:
+                p, ir = await asyncio.wait_for(
+                    asyncio.gather(self.robot.get_position(), self.robot.get_ir_proximity()),
+                    self.config.timeout_lectura)
+                break
+            except asyncio.TimeoutError:
+                if intento == intentos:
+                    raise TimeoutError(
+                        f"El robot no respondio a la lectura de odometria e IR en "
+                        f"{self.config.timeout_lectura:g} s ({intentos} intento/s): revise el Bluetooth") from None
+                print(f"Lectura inicial sin respuesta; reintento {intento}/{intentos-1}")
         if p is None or not all(math.isfinite(v) for v in (p.x, p.y, p.heading)):
             raise RuntimeError("Odometria no disponible")
         tiempo_pose = time.monotonic()
