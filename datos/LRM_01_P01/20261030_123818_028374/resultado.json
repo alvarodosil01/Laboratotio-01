@@ -1,0 +1,11 @@
+{
+  "resultado": "meta_alcanzada",
+  "tiempo_s": 36.821684000024106,
+  "error_final_m": 0.02038495082437365,
+  "vmax_ordenada_m_s": 0.481540044525567,
+  "ciclos_retrasados": 132,
+  "vmax_estimada_odometria_m_s": 0.3817491524074742,
+  "plazos_omitidos": 230,
+  "distancia_minima_obstaculos_m": null,
+  "nota": "Parte 01 sin IR. Velocidad ordenada y estimada por diferencias de odometria; no medida externa. Ciclo lento: dt > 1.05*Ts."
+}

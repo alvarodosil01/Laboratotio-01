@@ -1,0 +1,21 @@
+{
+  "resultado": "TimeoutError: ",
+  "tiempo_s": 87.80085310002323,
+  "error_final_m": 0.018819292394458127,
+  "pose_final_control": {
+    "x_m": 3.5866519295910213,
+    "y_m": 4.21326630252124,
+    "theta_rad": 0.5899212871740831,
+    "dx_meta_m": -0.013348070408978785,
+    "dy_meta_m": 0.013266302521239837,
+    "distancia_meta_m": 0.018819292394458127
+  },
+  "pose_final_parado": null,
+  "avance_tras_parar_m": null,
+  "vmax_ordenada_m_s": 0.49999003657407587,
+  "ciclos_retrasados": 307,
+  "vmax_estimada_odometria_m_s": 0.4898412805153596,
+  "plazos_omitidos": 523,
+  "distancia_minima_obstaculos_m": null,
+  "nota": "Parte 01 sin IR. Velocidad ordenada y estimada por diferencias de odometria; no medida externa. Ciclo lento: dt > 1.05*Ts."
+}
