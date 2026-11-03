@@ -1,0 +1,17 @@
+{
+  "resultado": "meta_alcanzada",
+  "exito": true,
+  "tiempo_s": 85.7373488000012,
+  "error_final_m": 0.047414872390110815,
+  "colision": false,
+  "estrategia_escape": "submeta",
+  "minimos_detectados": 1,
+  "escapes": 1,
+  "escapes_agotados": 0,
+  "distancia_minima_ir_m": 0.11955569461827284,
+  "vmax_ordenada_m_s": 0.24318433265263673,
+  "vmax_estimada_odometria_m_s": 0.26473082462358427,
+  "ciclos_lentos": 262,
+  "plazos_omitidos": 592,
+  "nota": "Minima IR estimada, no separacion de todo el chasis. Velocidad odometrica estimada; ciclo lento dt > 1.05*Ts."
+}

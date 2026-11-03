@@ -1,0 +1,17 @@
+{
+  "resultado": "TimeoutError: El robot no respondio a la lectura de odometria e IR en 2 s (3 intento/s): revise el Bluetooth",
+  "exito": false,
+  "tiempo_s": 87.32598190000863,
+  "error_final_m": 0.3499526960315959,
+  "colision": false,
+  "estrategia_escape": "contorno",
+  "minimos_detectados": 2,
+  "escapes": 2,
+  "escapes_agotados": 0,
+  "distancia_minima_ir_m": 0.09597701149425288,
+  "vmax_ordenada_m_s": 0.24482052412149358,
+  "vmax_estimada_odometria_m_s": 0.29936925232721034,
+  "ciclos_lentos": 250,
+  "plazos_omitidos": 561,
+  "nota": "Minima IR estimada, no separacion de todo el chasis. Velocidad odometrica estimada; ciclo lento dt > 1.05*Ts."
+}

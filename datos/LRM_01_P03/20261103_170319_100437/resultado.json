@@ -1,0 +1,17 @@
+{
+  "resultado": "ValueError: coroutine already executing",
+  "exito": false,
+  "tiempo_s": 79.28375889998279,
+  "error_final_m": 1.4991316125855958,
+  "colision": false,
+  "estrategia_escape": "submeta",
+  "minimos_detectados": 2,
+  "escapes": 2,
+  "escapes_agotados": 0,
+  "distancia_minima_ir_m": 0.10087131367292225,
+  "vmax_ordenada_m_s": 0.22289987136890554,
+  "vmax_estimada_odometria_m_s": 0.24894843019564922,
+  "ciclos_lentos": 205,
+  "plazos_omitidos": 587,
+  "nota": "Minima IR estimada, no separacion de todo el chasis. Velocidad odometrica estimada; ciclo lento dt > 1.05*Ts."
+}
