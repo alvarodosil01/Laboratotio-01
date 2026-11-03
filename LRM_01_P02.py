@@ -233,11 +233,13 @@ def avisos_inicio(c):
 
 
 # CONFIGURACION
-# Angulos aproximados de los 7 IR frontales del Create 3 respecto a x_R
-# (0 = delante, positivo = izquierda), del sensor derecho al izquierdo.
-# VERIFICAR el orden real del vector del SDK (indicaciones 2.2.3).
+# Angulos de los 7 IR frontales del Create 3 respecto a x_R
+# (0 = delante, positivo = izquierda), en el ORDEN del vector del SDK:
+# el indice 0 es el sensor lateral IZQUIERDO y el 6 el lateral derecho.
+# Comprobado con el registro del 02/11 (con el orden contrario la
+# repulsion empujaba hacia el obstaculo y el robot choco).
 ANGULOS_IR_DEFECTO = tuple(
-    math.radians(a) for a in (-65.3, -38.0, -20.0, -3.0, 14.25, 34.0, 65.3)
+    math.radians(a) for a in (65.3, 34.0, 14.25, -3.0, -20.0, -38.0, -65.3)
 )
 
 # clave: (nombre, formula, ganancia propuesta).
@@ -276,7 +278,10 @@ class Configuracion:
     kw: float = 1.5
 
     # Unidades internas: metros, segundos y radianes.
-    vmax: float = 0.20  # Recomendado en las indicaciones: <= 0.20 m/s.
+    # Los IR detectan hasta 25 cm y cada ciclo tarda ~0.6 s: a mas de
+    # ~12 cm/s el robot no tiene dos lecturas para frenar (choque medido
+    # el 02/11 a 20 cm/s sin ninguna deteccion previa).
+    vmax: float = 0.12
     wmax: float = 0.8
     rueda_max: float = 0.50
     aceleracion: float = 0.10  # m/s2.
@@ -285,17 +290,20 @@ class Configuracion:
     separacion_ruedas: float = 0.235  # Medir antes de validar.
     tolerancia: float = 0.05
     tolerancia_angular: float = math.radians(3)
-    # Periodo real: leer pose + IR y enviar ruedas por Bluetooth.
-    periodo: float = 0.30
+    # Periodo real medido: pose + IR + ruedas por Bluetooth = 0.6 s.
+    periodo: float = 0.60
     # Retraso entre la pose leida y el efecto de la orden (ver P01).
     latencia: float = 0.30
-    tiempo_max: float = 180.0
+    tiempo_max: float = 300.0
     timeout_lectura: float = 2.0
 
     # Repulsion (activa desde P02).
     repulsivo: str = "cuadratico"
     ganancia_repulsiva: float = 0.002
     influencia: float = 0.25
+    # Componente de rodeo: fraccion de |F_rep| aplicada en tangente.
+    # 0 = campo repulsivo puro (el robot puede quedarse frente al obstaculo).
+    ganancia_rodeo: float = 2.0
 
     # Percepcion IR.
     angulos_ir: tuple = ANGULOS_IR_DEFECTO  # Radianes, orden del SDK.
@@ -305,6 +313,9 @@ class Configuracion:
     calibracion_json: str = ""  # Vacio: tabla de la sesion 04.
     memoria_obstaculos: float = 5.0  # s que se recuerda cada deteccion.
     radio_robot: float = 0.17  # Create 3: 34 cm de diametro.
+    # Pedir pose e IR a la vez acorta el ciclo. Desactivado por defecto
+    # hasta comprobar que el SDK responde bien a dos consultas seguidas.
+    lecturas_simultaneas: bool = False
 
     def validar(self):
         for nombre, valor in asdict(self).items():
@@ -335,6 +346,9 @@ class Configuracion:
             raise ValueError(
                 "El SDK limita el avance y cada rueda a 50 cm/s"
             )
+
+        if self.ganancia_rodeo < 0:
+            raise ValueError("ganancia_rodeo: no puede ser negativa")
 
         if self.repulsivo not in REPULSIVOS:
             raise ValueError("Funcion repulsiva desconocida")
@@ -502,7 +516,10 @@ def mostrar_configuracion(c, menu=True):
             f"d0 = {c.influencia*100:g} cm"
         ),
         estilo(formula, TENUE),
-        f"relacion kr/ka = {c.ganancia_repulsiva/c.ganancia:g}"
+        _junto(
+            f"relacion kr/ka = {c.ganancia_repulsiva/c.ganancia:g}",
+            f"rodeo = {c.ganancia_rodeo:g}"
+        )
     )
     apartado(
         tecla("7"), "Sensores IR",
@@ -516,7 +533,10 @@ def mostrar_configuracion(c, menu=True):
         ),
         _junto(
             f"memoria {c.memoria_obstaculos:g} s",
-            f"radio robot {c.radio_robot*100:g} cm"
+            f"radio robot {c.radio_robot*100:g} cm",
+            "pose+IR " + (
+                "a la vez" if c.lecturas_simultaneas else "una tras otra"
+            )
         ),
         "calibracion: " + (c.calibracion_json or "tabla de la sesion 04")
     )
@@ -731,13 +751,17 @@ def editar_repulsion(c):
         ganancia = REPULSIVOS[repulsivo][2]
         nota(f"Ganancia propuesta para esta funcion: {ganancia:g}")
 
-    return editar_parametros(
+    c = editar_parametros(
         replace(c, repulsivo=repulsivo, ganancia_repulsiva=ganancia),
         (
             ("ganancia_repulsiva", "Ganancia repulsiva kr", 1),
             ("influencia", "Distancia de influencia d0 (cm, ≤ 25)", 100)
         )
     )
+
+    nota("Rodeo: 0 = repulsion pura; 2 = tangente el doble de |F_rep|.")
+    rodeo = pedir_numero("Ganancia de rodeo", c.ganancia_rodeo)
+    return replace(c, ganancia_rodeo=rodeo).validar()
 
 
 def editar_sensores(c):
@@ -782,6 +806,13 @@ def editar_sensores(c):
             break
         except (OSError, ValueError, TypeError) as error:
             fallo(f"Calibracion no valida: {error}")
+
+    simultaneas = preguntar(
+        "Leer pose e IR a la vez (s/n)",
+        "s" if c.lecturas_simultaneas else "n"
+    ).strip().lower()
+    if simultaneas in ("s", "n"):
+        c = replace(c, lecturas_simultaneas=simultaneas == "s")
 
     return editar_parametros(
         replace(c, angulos_ir=angulos, calibracion_json=ruta),
@@ -889,7 +920,7 @@ def configurar():
     p.add_argument("--transicion-cm", type=float, default=30.0)
     p.add_argument("--kv", type=float, default=2.0)
     p.add_argument("--kw", type=float, default=1.5)
-    p.add_argument("--vmax-cm-s", type=float, default=20.0)
+    p.add_argument("--vmax-cm-s", type=float, default=12.0)
     p.add_argument(
         "--wmax-grados-s",
         type=float,
@@ -900,9 +931,9 @@ def configurar():
     p.add_argument("--frenado-cm-s2", type=float, default=10.0)
     p.add_argument("--separacion-cm", type=float, default=23.5)
     p.add_argument("--tolerancia-cm", type=float, default=5.0)
-    p.add_argument("--periodo", type=float, default=0.30)
+    p.add_argument("--periodo", type=float, default=0.60)
     p.add_argument("--latencia", type=float, default=0.30)
-    p.add_argument("--tiempo-max", type=float, default=180.0)
+    p.add_argument("--tiempo-max", type=float, default=300.0)
     p.add_argument("--tolerancia-angular-grados", type=float, default=3.0)
     p.add_argument("--timeout-lectura", type=float, default=2.0)
     p.add_argument(
@@ -916,6 +947,7 @@ def configurar():
         help="Por defecto, la propuesta para la funcion elegida"
     )
     p.add_argument("--influencia-cm", type=float, default=25.0)
+    p.add_argument("--ganancia-rodeo", type=float, default=2.0)
     p.add_argument(
         "--angulos-grados",
         type=float,
@@ -926,6 +958,11 @@ def configurar():
     p.add_argument("--seguridad-cm", type=float, default=6.0)
     p.add_argument("--fuerza-max-sensor", type=float, default=2.0)
     p.add_argument("--memoria-obstaculos", type=float, default=5.0)
+    p.add_argument(
+        "--lecturas-simultaneas",
+        action="store_true",
+        help="Pedir pose e IR a la vez (ciclo mas corto)"
+    )
     p.add_argument(
         "--calibracion-json",
         default="",
@@ -1005,11 +1042,13 @@ def configurar():
                 else a.ganancia_repulsiva
             ),
             influencia=a.influencia_cm/100,
+            ganancia_rodeo=a.ganancia_rodeo,
             angulos_ir=angulos,
             filtro_alpha=a.alpha,
             seguridad=a.seguridad_cm/100,
             fuerza_max_sensor=a.fuerza_max_sensor,
             memoria_obstaculos=a.memoria_obstaculos,
+            lecturas_simultaneas=a.lecturas_simultaneas,
             calibracion_json=a.calibracion_json,
             **configuracion_extra(a)
         ).validar()
@@ -1073,6 +1112,7 @@ class MemoriaControl:
     def __init__(self):
         self.actual = 0.0
         self.giro = 0.0
+        self.lado_rodeo = 0  # +1 rodear por la izquierda, -1 derecha.
 
     def limitar(self, objetivo, dt, config):
         """Limita los aumentos; las reducciones se aplican al momento."""
@@ -1453,6 +1493,35 @@ def repulsion(obstaculos, config):
     return u, fx, fy
 
 
+def rodeo(f_atr, f_rep, memoria, config):
+    """Componente tangencial para rodear el obstaculo (campo rotacional).
+
+    Con el obstaculo de frente, F_rep apunta contra F_atr y ambas se
+    anulan: el robot se para delante. Se anade la repulsion girada 90
+    grados hacia el lado de la meta, con modulo ganancia_rodeo*|F_rep|.
+    El lado se recalcula en cada ciclo (el de la meta). Solo cuando el
+    obstaculo esta casi de frente (ambos lados valen) se conserva el
+    anterior, para no dudar entre izquierda y derecha.
+    """
+    rx, ry = f_rep
+    norma = math.hypot(rx, ry)
+
+    if norma < 1e-9 or config.ganancia_rodeo == 0:
+        memoria.lado_rodeo = 0
+        return 0.0, 0.0
+
+    # Seno del angulo entre la repulsion y la atraccion: su signo indica
+    # hacia que lado de la repulsion queda la meta.
+    cruz = (rx*f_atr[1] - ry*f_atr[0]) / (
+        norma*max(math.hypot(*f_atr), 1e-9)
+    )
+    if memoria.lado_rodeo == 0 or abs(cruz) > math.sin(math.radians(15)):
+        memoria.lado_rodeo = 1 if cruz >= 0 else -1
+
+    k = config.ganancia_rodeo*memoria.lado_rodeo
+    return -k*ry, k*rx
+
+
 # DECISION DE CADA CICLO
 @dataclass(frozen=True)
 class Lectura:
@@ -1504,6 +1573,10 @@ def calcular_ciclo(lectura, config, memoria, supervisor, mapa,
     mapa.actualizar(pose, lectura.filtradas, t, config)
     obstaculos = mapa.obstaculos(pose, config)
     u_rep, rx, ry = repulsion(obstaculos, config)
+    f_rep_pura = (rx, ry)
+    # F_rep incluye la componente de rodeo (tangente al obstaculo).
+    tx, ty = rodeo(f_atr, (rx, ry), memoria, config)
+    rx, ry = rx + tx, ry + ty
     f_rep = (rx, ry)
     f_res = (f_atr[0] + rx, f_atr[1] + ry)
     corregida, evento = f_res, ""
@@ -1536,7 +1609,9 @@ def calcular_ciclo(lectura, config, memoria, supervisor, mapa,
 
     else:
         corregida, estado, evento = supervisor.corregir(
-            pose, t, distancia, f_res, f_rep, obstaculos, config
+            # Repulsion sin rodeo: el rodeo empuja hacia la meta real y
+            # el escape puede necesitar ir hacia otro punto.
+            pose, t, distancia, f_res, f_rep_pura, obstaculos, config
         )
         v, w = velocidades(*corregida, distancia, config, memoria)
         v = min(memoria.limitar(v, dt, config),
@@ -1859,14 +1934,17 @@ class Adaptador:
         )
 
     async def leer_entorno(self):
-        # Consultas secuenciales: no se presupone que el SDK serialice
-        # peticiones concurrentes.
-        pose = await self.leer_pose()
-
-        ir = await asyncio.wait_for(
+        lectura_ir = asyncio.wait_for(
             self.robot.get_ir_proximity(),
             self.config.timeout_lectura
         )
+
+        if self.config.lecturas_simultaneas:
+            pose, ir = await asyncio.gather(self.leer_pose(), lectura_ir)
+        else:
+            # Consultas una tras otra: opcion segura por defecto.
+            pose = await self.leer_pose()
+            ir = await lectura_ir
         if ir is None:
             raise RuntimeError("Sensores IR no disponibles")
 

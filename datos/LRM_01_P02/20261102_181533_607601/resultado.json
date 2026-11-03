@@ -1,0 +1,16 @@
+{
+  "resultado": "RuntimeError: Parachoques activado; mision cancelada",
+  "exito": false,
+  "tiempo_s": 11.375,
+  "error_final_m": 3.996720685807287,
+  "error_tras_parada_m": null,
+  "pose_tras_parada": null,
+  "colision": true,
+  "distancia_minima_ir_m": null,
+  "emergencias_ir": 0,
+  "escapes": 0,
+  "vmax_ordenada_m_s": 0.1999606566079325,
+  "vmax_estimada_odometria_m_s": 0.2388486944895984,
+  "ciclos_retrasados": 17,
+  "nota": "Distancia minima estimada por IR (frontales), no separacion geometrica de todo el chasis. Velocidad estimada por odometria. Ciclo lento: dt > 1.05*Ts."
+}
