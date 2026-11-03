@@ -1,0 +1,13 @@
+{
+  "resultado": "Parachoques activado; mision cancelada",
+  "exito": false,
+  "tiempo_s": 20.277421299979324,
+  "error_final_m": 2.445751904116404,
+  "colision": true,
+  "distancia_minima_ir_m": 0.16095238095238096,
+  "vmax_ordenada_m_s": 0.29998475337869906,
+  "vmax_estimada_odometria_m_s": 0.33598731586694797,
+  "ciclos_lentos": 53,
+  "plazos_omitidos": 142,
+  "nota": "Minima IR estimada, no separacion de todo el chasis. Velocidad odometrica estimada; ciclo lento dt > 1.05*Ts."
+}

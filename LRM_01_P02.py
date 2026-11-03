@@ -33,13 +33,13 @@ class Configuracion:
     transicion: float = 0.30
     kv: float = 2.0
     kw: float = 1.5
-    # Ciclo real ~0.4 s y obstaculos visibles a ~15 cm: a 15 cm/s el robot
-    # recorria casi todo ese alcance antes de reaccionar. Limite SDK 50 cm/s.
-    vmax: float = 0.10
-    wmax: float = 0.8
+    # Con lecturas en paralelo el ciclo real es ~0.3 s (registro 20261103_100830).
+    # En espacio libre limite_por_percepcion acota a ~30 cm/s. Limite SDK 50 cm/s.
+    vmax: float = 0.50
+    wmax: float = 1.5
     rueda_max: float = 0.50
-    aceleracion: float = 0.10  # m/s2: aumento progresivo desde reposo.
-    frenado: float = 0.20  # m/s2: parametro del perfil de aproximacion.
+    aceleracion: float = 0.30  # m/s2: aumento progresivo desde reposo.
+    frenado: float = 0.50  # m/s2: parametro del perfil de aproximacion.
     separacion_ruedas: float = 0.235  # Heredada de T03: medir antes de validar.
     tolerancia: float = 0.05
     tolerancia_angular: float = math.radians(3)
@@ -61,7 +61,7 @@ class Configuracion:
     filtro_alpha: float = 1.0
     confirmaciones_ir: int = 1  # Lecturas consecutivas por sensor para activar repulsion.
     distancia_giro: float = 0.20  # IR frontal por debajo: girar en el sitio.
-    v_cerca: float = 0.05  # Avance maximo con un obstaculo a la vista.
+    v_cerca: float = 0.12  # Avance maximo con un obstaculo DELANTE (+-50 grados).
     presencia_ir: float = 0.70  # Fraccion del umbral IR frontal que ya frena.
     histeresis_ir: float = 0.10  # Desactivar al caer por debajo del 90% del umbral.
     seguridad: float = 0.06
@@ -272,11 +272,11 @@ def configurar():
     p.add_argument("--transicion-cm", type=float, default=30.0)
     p.add_argument("--kv", type=float, default=2.0)
     p.add_argument("--kw", type=float, default=1.5)
-    p.add_argument("--vmax-cm-s", type=float, default=10.0)
-    p.add_argument("--wmax-grados-s", type=float, default=math.degrees(0.8))
+    p.add_argument("--vmax-cm-s", type=float, default=30.0)
+    p.add_argument("--wmax-grados-s", type=float, default=math.degrees(1.5))
     p.add_argument("--rueda-max-cm-s", type=float, default=50.0)
-    p.add_argument("--aceleracion-cm-s2", type=float, default=10.0)
-    p.add_argument("--frenado-cm-s2", type=float, default=20.0)
+    p.add_argument("--aceleracion-cm-s2", type=float, default=30.0)
+    p.add_argument("--frenado-cm-s2", type=float, default=50.0)
     p.add_argument("--separacion-cm", type=float, default=23.5)
     p.add_argument("--tolerancia-cm", type=float, default=5.0)
     p.add_argument("--periodo", type=float, default=0.1)
@@ -294,7 +294,7 @@ def configurar():
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--seguridad-cm", type=float, default=6)
     p.add_argument("--giro-cm", type=float, default=20, help="IR frontal que provoca giro en el sitio")
-    p.add_argument("--v-cerca-cm-s", type=float, default=5, help="Avance maximo con obstaculo a la vista")
+    p.add_argument("--v-cerca-cm-s", type=float, default=12, help="Avance maximo con obstaculo delante")
     p.add_argument("--fuerza-max-sensor", type=float, default=2)
     p.add_argument("--calibracion-json", default="", help="Tabla {distancia_cm: [ir1,...,ir7]}")
     a = p.parse_args()
@@ -359,15 +359,23 @@ def pose_en_escenario(pose_sdk, origen_sdk, orientacion_inicial):
                 angulo_corto(pose_sdk.theta+desfase))
 
 
-def velocidades(fx, fy, distancia, config):
+def velocidades(fx, fy, distancia, config, w_previo=0.0, retraso=0.0):
     """Avance y giro simultaneos, incluso cuando la meta queda detras.
 
     La atenuacion angular positiva reduce el avance en curvas cerradas sin
     convertir la navegacion en un giro parado seguido de avance. El limite
     por distancia suaviza la llegada incluso con el potencial conico.
+
+    Cada orden actua ~1 ciclo tarde (registro 20261103_102021: con 14 grados
+    de error el robot siguio girando a 1.7 rad/s y se paso 45 grados: trazado
+    en S). Se descuenta el giro que aun hara la orden anterior durante
+    `retraso` y no se pide mas giro del que falta en un ciclo.
     """
     error = math.atan2(fy, fx)
-    w = max(-config.wmax, min(config.wmax, config.kw*error))
+    previsto = angulo_corto(error-w_previo*retraso)
+    w = max(-config.wmax, min(config.wmax, config.kw*previsto))
+    if retraso > 0:
+        w = max(-abs(previsto)/retraso, min(abs(previsto)/retraso, w))
     # Reservar distancia para un ciclo de avance y el frenado:
     # v*Ts + v^2/(2*b) <= distancia a la meta. Usar la distancia completa
     # evita tender a velocidad cero ANTES de entrar en la tolerancia.
@@ -389,6 +397,7 @@ class RampaAvance:
     """
     def __init__(self):
         self.actual = 0.0
+        self.giro = 0.0  # Ultimo w ordenado: aun no reflejado en la odometria.
 
     def limitar(self, objetivo, dt, config):
         # Un retraso Bluetooth no debe provocar un salto grande al reanudar.
@@ -739,16 +748,20 @@ def limite_por_percepcion(distancias, config, dt):
     """Limite adicional por alcance IR y proximidad, independiente del filtro.
 
     No suponer espacio infinito si no hay deteccion: limitar al radio util.
-    Reservar margen hasta seguridad y una latencia basada en el ultimo ciclo.
+    Reservar margen hasta seguridad y una latencia de DOS ciclos: la lectura
+    llega con un ciclo de retraso y la orden actua otro ciclo despues
+    (20261103_102514: obstaculo visto a 22 cm a 0.3 m/s, choque 0.8 s despues).
     Es un modelo conservador que requiere validacion fisica, no una garantia.
     """
     disponible = max(0.0, min(config.influencia, *distancias)-config.seguridad)
-    bt = config.frenado*max(config.periodo, dt)
+    bt = config.frenado*2*min(max(config.periodo, dt), RETRASO_MAX)
     return math.sqrt(bt*bt+2*config.frenado*disponible)-bt
 
 
 MARGEN_GIRO = 0.03  # m de histeresis para dejar de girar y volver a avanzar.
 ANGULO_FRONTAL = 0.5  # rad: sensores que miran al frente (0 y +-25 grados).
+ANGULO_DELANTE = 1.0  # rad: sensores en la trayectoria (0, +-25 y +-50 grados).
+RETRASO_MAX = 0.8  # s: un ciclo mas largo no se usa para predecir el giro.
 
 
 def decidir(lectura, config, rampa, esquiva, dt):
@@ -782,25 +795,34 @@ def decidir(lectura, config, rampa, esquiva, dt):
             esquiva.lado = elegir_lado(repulsion(lectura.distancias, config)[1:], atr)
         esquiva.libre = 0.0
         rampa.actual = 0.0
-        return Decision("GIRO_OBSTACULO", distancia, ua, ur, atr, rep, res,
-                        ruedas(0, esquiva.lado*config.wmax, config),
+        comando = ruedas(0, esquiva.lado*config.wmax, config)
+        rampa.giro = comando[3]
+        return Decision("GIRO_OBSTACULO", distancia, ua, ur, atr, rep, res, comando,
                         "Obstaculo delante: giro en el sitio", tan, esquiva.lado)
     if distancia <= config.tolerancia:
         rampa.actual = 0.0
         error = 0 if config.meta_theta is None else angulo_corto(config.meta_theta-pose.theta)
         estado = "LLEGADA" if abs(error) <= config.tolerancia_angular else "ORIENTACION_FINAL"
         w = 0 if estado == "LLEGADA" else max(-config.wmax, min(config.wmax, config.kw*error))
-        return Decision(estado, distancia, ua, ur, atr, rep, res, ruedas(0, w, config), "", tan, lado)
+        comando = ruedas(0, w, config)
+        rampa.giro = comando[3]
+        return Decision(estado, distancia, ua, ur, atr, rep, res, comando, "", tan, lado)
     # Misma ley de P01, ahora con F_atr + F_rep + F_tan en el marco local.
-    v, w = velocidades(*res, distancia, config)
-    v = min(v, limite_por_percepcion(lectura.distancias, config, dt))
-    # Con un obstaculo a la vista (incluso por debajo del umbral calibrado en
-    # los frontales) avanzar despacio: entre lectura y orden pasan ~2 ciclos.
-    if math.isfinite(cercania) or rep != (0.0, 0.0) or any(lectura.presencia[i] for i in frontales):
+    # Retraso estimado = ultimo ciclo; acotado ante cortes Bluetooth.
+    retraso = min(max(dt, config.periodo), RETRASO_MAX)
+    v, w = velocidades(*res, distancia, config, rampa.giro, retraso)
+    # Solo frenan los obstaculos en la trayectoria (+-50 grados): uno al costado
+    # o recordado detras mientras se rodea no se acerca al avanzar. Antes
+    # cualquier deteccion imponia v_cerca y el 77% del recorrido iba a 5 cm/s.
+    delante = [i for i, a in enumerate(config.angulos_ir) if abs(a) < ANGULO_DELANTE]
+    v = min(v, limite_por_percepcion([lectura.distancias[i] for i in delante], config, dt))
+    # Con un obstaculo delante (incluso por debajo del umbral calibrado)
+    # avanzar despacio: entre lectura y orden pasan ~2 ciclos.
+    if any(math.isfinite(lectura.distancias[i]) or lectura.presencia[i] for i in delante):
         v = min(v, config.v_cerca)
     v = rampa.limitar(v, dt, config)
     comando = ruedas(v, w, config)
-    rampa.actual = comando[2]
+    rampa.actual, rampa.giro = comando[2], comando[3]
     estado = "ESQUIVA" if lado else "NAVEGACION"
     return Decision(estado, distancia, ua, ur, atr, rep, res, comando, "", tan, lado)
 
